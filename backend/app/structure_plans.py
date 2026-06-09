@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
 
 from .ai_provider import ProviderRequestError, create_chat_completion
+from .context_assembly import NODE_CONTEXT_ROLE
 from .models import (
     AIGenerationPlan,
     CanvasEdge,
@@ -60,7 +61,7 @@ WORKFLOW_DEFAULT_TYPE: dict[StructureWorkflow, NodeType] = {
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -98,9 +99,17 @@ def _edge_semantic(value: Any, workflow: StructureWorkflow) -> EdgeSemantic:
 
 def _workflow_instructions(workflow: StructureWorkflow) -> str:
     if workflow == "generate-outline":
-        return "Create outline nodes derived from the selected source assets. Use type outline."
+        return (
+            "Create outline nodes derived from the selected source assets. Use type outline. "
+            "Outline node bodies must be structured outline notes only: hierarchy, beats, causality, constraints, and unresolved questions. "
+            "Do not write paragraph prose, narration, or dialogue."
+        )
     if workflow == "generate-scenes":
-        return "Create scene nodes derived from the selected outline/source assets. Use type scene."
+        return (
+            "Create scene nodes derived from the selected outline/source assets. Use type scene. "
+            "Scene node bodies must be scene plans: purpose, conflict, major beats, participating characters, setting continuity, and paragraph handoff. "
+            "Do not write final prose paragraphs."
+        )
     if workflow == "generate-paragraph-tasks":
         return (
             "Create executable paragraph placeholder nodes and instruction nodes. Paragraph node bodies should be empty; "
@@ -115,9 +124,11 @@ def _workflow_instructions(workflow: StructureWorkflow) -> str:
 def _source_context(source_nodes: list[CanvasNode]) -> str:
     parts: list[str] = []
     for node in source_nodes:
+        role = NODE_CONTEXT_ROLE.get(node.type, "REFERENCE")
         parts.append(
             "\n".join(
                 [
+                    f"ROLE: {role}",
                     f"ID: {node.id}",
                     f"TYPE: {node.type}",
                     f"TITLE: {node.title}",

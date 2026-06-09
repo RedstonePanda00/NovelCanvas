@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from .ai_provider import ProviderRequestError, create_embeddings
 from .models import (
@@ -32,7 +32,7 @@ from .stores import (
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _chunk_text(text: str, max_chars: int = 1200, overlap_chars: int = 160) -> list[str]:

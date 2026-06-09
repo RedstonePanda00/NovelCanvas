@@ -203,6 +203,12 @@ function createEdge(sourceNodeId: string, targetNodeId: string, semantic: EdgeSe
   };
 }
 
+function defaultEdgeSemanticForTargetType(targetType: NodeType): EdgeSemantic {
+  if (targetType === 'review') return 'review_target';
+  if (targetType === 'instruction') return 'must_follow';
+  return 'reference';
+}
+
 function defaultNodeTypeForWorkflow(workflow: StructureWorkflow): NodeType {
   if (workflow === 'generate-outline') return 'outline';
   if (workflow === 'generate-scenes') return 'scene';
@@ -593,6 +599,13 @@ function App() {
       document.body.style.overflow = previousOverflow;
     };
   }, [activeView]);
+
+  useEffect(() => {
+    if (!project || !edgeTargetId) return;
+    const targetNode = project.nodes.find((node) => node.id === edgeTargetId);
+    if (!targetNode) return;
+    setEdgeSemantic(defaultEdgeSemanticForTargetType(targetNode.type));
+  }, [edgeTargetId, project]);
 
   const selectedNode = useMemo(
     () => project?.nodes.find((node) => node.id === selectedNodeId) ?? null,
@@ -1199,7 +1212,8 @@ function App() {
       return;
     }
 
-    const edge = createEdge(sourceNodeId, targetNodeId, 'reference');
+    const targetNode = project.nodes.find((node) => node.id === targetNodeId);
+    const edge = createEdge(sourceNodeId, targetNodeId, defaultEdgeSemanticForTargetType(targetNode?.type ?? 'generic'));
     updateProject((current) => ({ ...current, edges: [...current.edges, edge] }));
     setSelectedEdgeId(edge.id);
     setSelectedNodeId('');

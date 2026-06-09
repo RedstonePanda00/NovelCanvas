@@ -4,7 +4,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from .ai_provider import ProviderRequestError, stream_chat_completion
-from .models import AIProviderConfig, CanvasEdge, CanvasNode, EdgeSemantic
+from .context_assembly import (
+    ContextAssemblyError,
+    context_sort_key,
+    format_direct_context,
+)
+from .models import AIProviderConfig, CanvasEdge, CanvasNode
 from .rag import preview_rag_for_target
 from .stores import find_provider, find_registered_model, read_project
 from .worldbook import collect_worldbook_entries, format_worldbook_context
@@ -19,34 +24,6 @@ class ParagraphGenerationSession:
     provider: AIProviderConfig
     modelId: str
     messages: list[dict[str, str]]
-
-
-CONTEXT_SEMANTIC_ORDER: list[EdgeSemantic] = [
-    "must_follow",
-    "instruction",
-    "reference",
-    "can_rewrite",
-    "style_reference",
-]
-
-SECTION_LABELS: dict[EdgeSemantic, str] = {
-    "must_follow": "MUST FOLLOW",
-    "instruction": "WRITING TASK",
-    "reference": "REFERENCE",
-    "can_rewrite": "CAN REWRITE",
-    "style_reference": "STYLE REFERENCE",
-    "review_basis": "REVIEW BASIS",
-    "review_target": "TEXT TO REVIEW",
-}
-
-
-def _edge_sort_value(edge: CanvasEdge) -> str:
-    return edge.metadata.createdAt if edge.metadata else edge.id
-
-
-def _node_context_text(node: CanvasNode) -> str:
-    tags = f"Tags: {', '.join(node.metadata.tags)}\n" if node.metadata.tags else ""
-    return f"Title: {node.title}\nType: {node.type}\n{tags}Body:\n{node.body or ''}".strip()
 
 
 def _collect_direct_context(target_node_id: str) -> tuple[CanvasNode, list[tuple[CanvasEdge, CanvasNode]]]:
@@ -71,32 +48,8 @@ def _collect_direct_context(target_node_id: str) -> tuple[CanvasNode, list[tuple
 
         items.append((edge, source))
 
-    items.sort(
-        key=lambda item: (
-            CONTEXT_SEMANTIC_ORDER.index(item[0].semantic)
-            if item[0].semantic in CONTEXT_SEMANTIC_ORDER
-            else len(CONTEXT_SEMANTIC_ORDER),
-            _edge_sort_value(item[0]),
-            item[0].id,
-        )
-    )
+    items.sort(key=context_sort_key)
     return target, items
-
-
-def _format_context(items: list[tuple[CanvasEdge, CanvasNode]]) -> str:
-    if not items:
-        return "No direct linked context nodes."
-
-    sections: list[str] = []
-    for semantic in CONTEXT_SEMANTIC_ORDER:
-        semantic_items = [(edge, node) for edge, node in items if edge.semantic == semantic]
-        if not semantic_items:
-            continue
-
-        body = "\n\n".join(_node_context_text(node) for _, node in semantic_items)
-        sections.append(f"{SECTION_LABELS[semantic]}:\n{body}")
-
-    return "\n\n---\n\n".join(sections)
 
 
 async def _format_rag_context(target_node_id: str) -> str:
@@ -111,7 +64,7 @@ async def _format_rag_context(target_node_id: str) -> str:
 
 
 async def _messages(target: CanvasNode, context_items: list[tuple[CanvasEdge, CanvasNode]]) -> list[dict[str, str]]:
-    direct_context = _format_context(context_items)
+    direct_context = await format_direct_context(context_items)
     rag_context = await _format_rag_context(target.id)
     context_nodes = [node for _, node in context_items]
     worldbook_entries = collect_worldbook_entries(target, context_nodes)
@@ -123,9 +76,10 @@ async def _messages(target: CanvasNode, context_items: list[tuple[CanvasEdge, Ca
             "role": "system",
             "content": (
                 "You are a controlled prose assistant inside a node-based novel writing workspace. "
-                "Write only prose for the selected paragraph node. "
+                "The target node type is paragraph. Write only final narrative prose for that paragraph. "
                 "Use only the triggered worldbook entries, direct linked context, and authorized RAG snippets provided below. "
-                "Do not create nodes, do not mention the canvas, and do not include analysis or headings."
+                "Scene references are primary continuity sources. Compressed paragraph references are prior prose context, not a style to copy blindly. "
+                "Do not write outlines, plans, labels, headings, analysis, reviews, or canvas commentary."
             ),
         },
         {
@@ -157,10 +111,14 @@ async def prepare_paragraph_generation(target_node_id: str) -> ParagraphGenerati
         raise ParagraphGenerationError(f"Provider is not registered: {registered_model.providerId}")
 
     target, context_items = _collect_direct_context(target_node_id)
+    try:
+        messages = await _messages(target, context_items)
+    except ContextAssemblyError as exc:
+        raise ParagraphGenerationError(str(exc)) from exc
     return ParagraphGenerationSession(
         provider=provider,
         modelId=registered_model.modelId,
-        messages=await _messages(target, context_items),
+        messages=messages,
     )
 
 

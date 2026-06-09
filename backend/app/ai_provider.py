@@ -67,6 +67,7 @@ async def create_chat_completion(
     model_id: str,
     messages: list[dict[str, str]],
     max_tokens: int = 2000,
+    json_response: bool = True,
 ) -> str:
     payload = {
         "model": model_id,
@@ -74,8 +75,9 @@ async def create_chat_completion(
         "max_tokens": max_tokens,
         "stream": False,
         "temperature": 0.4,
-        "response_format": {"type": "json_object"},
     }
+    if json_response:
+        payload["response_format"] = {"type": "json_object"}
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
