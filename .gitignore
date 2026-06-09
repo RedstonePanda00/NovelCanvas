@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+node_modules/
+dist/
+local-app-config.json
+.local-test-config/
+
+# Personal project data (not part of the open-source app)
+project.json
+knowledge-base/
+
+# Runtime logs
+.logs/
