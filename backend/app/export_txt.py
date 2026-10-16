@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .models import CanvasNode, ProjectFile
-from .stores import read_project
 
 
 def _ordered_nodes(project: ProjectFile, node_ids: list[str]) -> list[CanvasNode]:
@@ -31,39 +30,51 @@ def _format_asset(node: CanvasNode) -> str:
     return "\n".join(metadata_lines).strip()
 
 
-def _container_manuscript(project: ProjectFile, node: CanvasNode) -> list[str]:
-    node_by_id = {item.id: item for item in project.nodes}
-    parts: list[str] = []
-    if node.title:
-        parts.append(node.title)
-    if node.body:
-        parts.append(node.body)
-
-    for child_id in node.childNodeIds:
-        child = node_by_id.get(child_id)
-        if child is None:
-            continue
-        if child.type == "paragraph" and child.body:
-            parts.append(child.body)
-        elif child.type == "container":
-            parts.extend(_container_manuscript(project, child))
-
-    return parts
-
-
 def _format_manuscript(project: ProjectFile, nodes: list[CanvasNode]) -> str:
-    parts: list[str] = []
+    node_by_id = {node.id: node for node in project.nodes}
+    descendants: set[str] = set()
+
+    def collect(node: CanvasNode) -> None:
+        if node.type != "container":
+            return
+        for child_id in node.childNodeIds:
+            if child_id in descendants:
+                continue
+            descendants.add(child_id)
+            child = node_by_id.get(child_id)
+            if child is not None:
+                collect(child)
+
     for node in nodes:
+        collect(node)
+
+    emitted: set[str] = set()
+    parts: list[str] = []
+
+    def emit(node: CanvasNode) -> None:
+        if node.id in emitted:
+            return
+        emitted.add(node.id)
         if node.type == "paragraph" and node.body:
             parts.append(node.body)
         elif node.type == "container":
-            parts.extend(_container_manuscript(project, node))
+            if node.title:
+                parts.append(node.title)
+            if node.body:
+                parts.append(node.body)
+            for child_id in node.childNodeIds:
+                child = node_by_id.get(child_id)
+                if child is not None:
+                    emit(child)
+
+    for node in nodes:
+        if node.id not in descendants:
+            emit(node)
 
     return "\n\n".join(part.strip() for part in parts if part.strip())
 
 
-def export_txt(node_ids: list[str], mode: str) -> str:
-    project = read_project()
+def export_txt(project: ProjectFile, node_ids: list[str], mode: str) -> str:
     nodes = _ordered_nodes(project, node_ids)
 
     if mode == "manuscript":

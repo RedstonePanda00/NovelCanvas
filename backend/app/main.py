@@ -1,3 +1,5 @@
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -9,11 +11,11 @@ from .ai_provider import ProviderRequestError, list_models, test_chat_completion
 from .models import (
     AIProviderConfig,
     AIGenerationPlan,
+    ContextPreviewRequest,
+    ContextPreviewResponse,
     KnowledgeBaseMetadata,
-    KnowledgeDocumentCreateRequest,
-    KnowledgeDocumentCreateResponse,
     KnowledgeReindexResult,
-    LocalAppConfig,
+    MemoryReindexRequest,
     ModelListResponse,
     NodeCompletionRequest,
     ParagraphGenerationRequest,
@@ -27,39 +29,42 @@ from .models import (
     RagPreviewResponse,
     RegisteredModel,
     RegisterModelRequest,
-    ReviewGenerationRequest,
     StructurePlanRequest,
     TxtExportRequest,
     to_public_local_app_config,
 )
 from .export_txt import export_txt
+from .context_preview import build_context_preview
 from .paragraph_generation import (
     ParagraphGenerationError,
     prepare_paragraph_generation,
     stream_paragraph_generation,
 )
 from .node_completion import NodeCompletionError, prepare_node_completion, stream_node_completion
-from .rag import add_knowledge_document, preview_rag_for_target, reindex_knowledge_base
-from .review_generation import ReviewGenerationError, prepare_review_generation, stream_review_generation
+from .rag import memory_metadata_for_project, preview_rag_for_target, reindex_knowledge_base
 from .security import SecretValidationError
 from .stores import (
     export_project,
     import_project,
     find_provider,
     initialize_storage,
-    read_knowledge_metadata,
     read_local_app_config,
     read_project,
     storage_status,
     upsert_provider,
     upsert_registered_model,
-    write_local_app_config,
     write_project,
 )
 from .structure_plans import StructurePlanError, generate_structure_plan
+from .assistant_workbench import router as assistant_router
+from .assistant_stream import router as assistant_stream_router
+from .scene_stream import router as scene_stream_router
 
 
-app = FastAPI(title="Novel Canvas API", version="0.1.0")
+app = FastAPI(title="Novel Canvas API", version="0.2.0")
+app.include_router(assistant_router)
+app.include_router(assistant_stream_router)
+app.include_router(scene_stream_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,6 +73,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _ndjson(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+async def _ndjson_events(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
+    try:
+        async for chunk in chunks:
+            if chunk:
+                yield _ndjson({"type": "chunk", "text": chunk})
+        yield _ndjson({"type": "done"})
+    except RuntimeError as exc:
+        yield _ndjson(
+            {
+                "type": "error",
+                "error": {
+                    "code": "generation_failed",
+                    "message": str(exc),
+                },
+            }
+        )
 
 
 @app.on_event("startup")
@@ -121,37 +148,38 @@ def get_app_config() -> PublicLocalAppConfig:
     return to_public_local_app_config(read_local_app_config())
 
 
-@app.put("/api/app-config")
-def put_app_config(config: LocalAppConfig) -> LocalAppConfig:
-    return write_local_app_config(config)
+@app.post("/api/memory")
+def post_memory_status(request: MemoryReindexRequest) -> KnowledgeBaseMetadata:
+    return memory_metadata_for_project(request.project)
 
 
-@app.get("/api/knowledge")
-def get_knowledge() -> KnowledgeBaseMetadata:
-    return read_knowledge_metadata()
+@app.post("/api/memory/reindex")
+async def post_memory_reindex(request: MemoryReindexRequest) -> KnowledgeReindexResult:
+    return await reindex_knowledge_base(request.project)
 
 
-@app.post("/api/knowledge/documents")
-async def post_knowledge_document(request: KnowledgeDocumentCreateRequest) -> KnowledgeDocumentCreateResponse:
-    if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Knowledge document text cannot be empty.")
-    return await add_knowledge_document(request.title.strip() or "Untitled Document", request.text, request.tags)
-
-
-@app.post("/api/knowledge/reindex")
-async def post_knowledge_reindex() -> KnowledgeReindexResult:
-    return await reindex_knowledge_base()
-
-
-@app.post("/api/rag/preview")
+@app.post("/api/memory/preview")
 async def post_rag_preview(request: RagPreviewRequest) -> RagPreviewResponse:
-    return await preview_rag_for_target(request.targetNodeId, request.limit)
+    return await preview_rag_for_target(request.project, request.targetNodeId, request.limit)
+
+
+@app.post("/api/context/preview")
+def post_context_preview(request: ContextPreviewRequest) -> ContextPreviewResponse:
+    try:
+        return build_context_preview(request.project, request.targetNodeId)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/plans/structure")
 async def post_structure_plan(request: StructurePlanRequest) -> AIGenerationPlan:
     try:
-        return await generate_structure_plan(request.workflow, request.sourceNodeIds)
+        return await generate_structure_plan(
+            request.project,
+            request.workflow,
+            request.sourceNodeIds,
+            request.desiredCount,
+        )
     except StructurePlanError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -159,67 +187,49 @@ async def post_structure_plan(request: StructurePlanRequest) -> AIGenerationPlan
 @app.post("/api/generation/paragraph/stream")
 async def post_paragraph_generation_stream(request: ParagraphGenerationRequest) -> StreamingResponse:
     try:
-        session = await prepare_paragraph_generation(request.targetNodeId)
+        session = await prepare_paragraph_generation(request.project, request.targetNodeId, request.mode)
     except ParagraphGenerationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    async def stream() -> Any:
-        try:
-            async for chunk in stream_paragraph_generation(session):
-                yield chunk
-        except ParagraphGenerationError as exc:
-            yield f"\n[Generation error: {exc}]"
-
-    return StreamingResponse(stream(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(
+        _ndjson_events(stream_paragraph_generation(session)),
+        media_type="application/x-ndjson; charset=utf-8",
+    )
 
 
 @app.post("/api/generation/node-completion/stream")
 async def post_node_completion_stream(request: NodeCompletionRequest) -> StreamingResponse:
     try:
-        session = await prepare_node_completion(request.targetNodeId)
+        session = await prepare_node_completion(request.project, request.targetNodeId)
     except NodeCompletionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    async def stream() -> Any:
-        try:
-            async for chunk in stream_node_completion(session):
-                yield chunk
-        except NodeCompletionError as exc:
-            yield f"\n[Generation error: {exc}]"
-
-    return StreamingResponse(stream(), media_type="text/plain; charset=utf-8")
-
-
-@app.post("/api/generation/review/stream")
-async def post_review_generation_stream(request: ReviewGenerationRequest) -> StreamingResponse:
-    try:
-        session = await prepare_review_generation(request.targetNodeId)
-    except ReviewGenerationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    async def stream() -> Any:
-        try:
-            async for chunk in stream_review_generation(session):
-                yield chunk
-        except ReviewGenerationError as exc:
-            yield f"\n[Generation error: {exc}]"
-
-    return StreamingResponse(stream(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(
+        _ndjson_events(stream_node_completion(session)),
+        media_type="application/x-ndjson; charset=utf-8",
+    )
 
 
 @app.post("/api/export/txt")
 def post_export_txt(request: TxtExportRequest) -> StreamingResponse:
-    text = export_txt(request.nodeIds, request.mode)
+    text = export_txt(request.project, request.nodeIds, request.mode)
     return StreamingResponse(iter([text]), media_type="text/plain; charset=utf-8")
 
 
 @app.post("/api/providers/register")
 def post_provider_register(request: ProviderRegistrationRequest) -> PublicLocalAppConfig:
+    existing = find_provider(request.id)
+    if request.clearApiKey:
+        api_key = ""
+    elif request.apiKey:
+        api_key = request.apiKey
+    else:
+        api_key = existing.apiKey if existing else ""
     provider = AIProviderConfig(
         id=request.id,
         name=request.name,
         baseUrl=request.baseUrl,
-        apiKey=request.apiKey,
+        apiKey=api_key,
         headers=request.headers,
     )
     config = upsert_provider(provider)

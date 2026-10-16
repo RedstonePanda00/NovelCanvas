@@ -2,6 +2,9 @@ __pycache__/
 .venv/
 node_modules/
 dist/
+test-results/
+playwright-report/
+coverage/
 local-app-config.json
 .local-test-config/
 

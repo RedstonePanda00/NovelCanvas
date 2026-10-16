@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from .ai_provider import ProviderRequestError, create_chat_completion
-from .models import CanvasEdge, CanvasNode, EdgeSemantic
-from .stores import find_provider, find_registered_model, read_project
+from .generation_common import language_contract, resolve_routed_model
+from .model_prompts import apply_model_global_prompt
+from .models import CanvasEdge, CanvasNode, EdgeSemantic, ProjectFile
 
 
 CONTEXT_SEMANTIC_ORDER: list[EdgeSemantic] = [
@@ -24,15 +25,13 @@ SECTION_LABELS: dict[EdgeSemantic, str] = {
 }
 
 NODE_CONTEXT_ROLE: dict[str, str] = {
-    "scene": "PRIMARY SCENE REFERENCE",
-    "outline": "STRUCTURE REFERENCE",
+    "scene": "STRICT SCENE SOURCE",
+    "outline": "STRUCTURE SOURCE FOR SCENE DERIVATION",
     "instruction": "DIRECT INSTRUCTION",
     "character": "CHARACTER REFERENCE",
     "supplemental_info": "SUPPLEMENTAL REFERENCE",
-    "paragraph": "COMPRESSED PARAGRAPH REFERENCE",
+    "paragraph": "CONTINUITY SUMMARY ONLY",
     "container": "CONTAINER REFERENCE",
-    "generic": "GENERAL REFERENCE",
-    "review": "REVIEW REFERENCE",
 }
 
 NODE_TYPE_ORDER: dict[str, int] = {
@@ -43,7 +42,6 @@ NODE_TYPE_ORDER: dict[str, int] = {
     "character": 4,
     "paragraph": 5,
     "container": 6,
-    "generic": 7,
 }
 
 
@@ -73,55 +71,73 @@ def context_sort_key(item: tuple[CanvasEdge, CanvasNode]) -> tuple[int, int, str
 def node_context_text(node: CanvasNode, body: str | None = None) -> str:
     tags = f"Tags: {', '.join(node.metadata.tags)}\n" if node.metadata.tags else ""
     role = NODE_CONTEXT_ROLE.get(node.type, "REFERENCE")
+    note = ""
+    if node.type == "paragraph":
+        note = (
+            "Usage note: this paragraph summary is only for continuity with already-written prose. "
+            "Do not treat it as a required beat, target content, or style template.\n"
+        )
+    if node.type == "scene":
+        note = (
+            "Usage note: this scene is a strict source for paragraph generation. "
+            "Preserve its ordered beats, causality, entry state, exit state, and constraints unless a DIRECT INSTRUCTION explicitly overrides them.\n"
+        )
+    if node.type == "outline":
+        note = (
+            "Usage note: this outline is structure for scene derivation. "
+            "Do not use it as final prose or dialogue.\n"
+        )
     return (
         f"Role: {role}\n"
         f"Title: {node.title}\n"
         f"Type: {node.type}\n"
         f"{tags}"
+        f"{note}"
         f"Body:\n{body if body is not None else node.body or ''}"
     ).strip()
 
 
-async def compress_paragraph_reference(node: CanvasNode) -> str:
+async def compress_paragraph_reference(project: ProjectFile, node: CanvasNode) -> str:
     body = (node.body or "").strip()
     if not body:
         return ""
 
-    project = read_project()
-    model_id = project.settings.modelRouting.contextCompressionModelId
-    if not model_id:
-        raise ContextAssemblyError("Paragraph reference compression requires a context compression model in Settings.")
-
-    registered_model = find_registered_model(model_id)
-    if registered_model is None:
-        raise ContextAssemblyError(f"Context compression model is not registered: {model_id}")
-
-    provider = find_provider(registered_model.providerId)
-    if provider is None:
-        raise ContextAssemblyError(f"Provider is not registered: {registered_model.providerId}")
+    try:
+        routed = resolve_routed_model(project, "contextCompressionModelId", "context compression")
+    except ValueError as exc:
+        raise ContextAssemblyError(str(exc)) from exc
 
     try:
         return await create_chat_completion(
-            provider,
-            registered_model.modelId,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You compress long paragraph nodes for use as writing context. "
-                        "Preserve plot facts, character decisions, causality, setting details, tone, and unresolved hooks. "
-                        "Do not continue the story. Output a concise reference summary only."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Paragraph title: {node.title}\n"
-                        f"Tags: {', '.join(node.metadata.tags)}\n\n"
-                        f"Paragraph body:\n{body}"
-                    ),
-                },
-            ],
+            routed.provider,
+            routed.registered.modelId,
+            apply_model_global_prompt(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You compress long paragraph nodes into continuity summaries only. "
+                            "Preserve already-established plot facts, character decisions, causality, setting state, tone, and unresolved hooks. "
+                            "Do not add new story ideas, do not suggest future beats, and do not imply the next generated content must include every detail. "
+                            "Omit decorative portrait wording and repeated signature-feature descriptions unless they affect identification, "
+                            "a changed physical condition, or causality. When such a detail matters, summarize it as an already-established fact, "
+                            "not as a description to reproduce. Preserve injuries, disguises and other action-relevant physical constraints. "
+                            f"Output a concise reference summary only. {language_contract(project)}"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Paragraph title: {node.title}\n"
+                            f"Tags: {', '.join(node.metadata.tags)}\n\n"
+                            f"Paragraph body:\n{body}"
+                        ),
+                    },
+                ],
+                project,
+                "contextCompressionModelId",
+                routed.registered.id,
+            ),
             max_tokens=700,
             json_response=False,
         )
@@ -129,20 +145,30 @@ async def compress_paragraph_reference(node: CanvasNode) -> str:
         raise ContextAssemblyError(f"Paragraph reference compression failed: {exc}") from exc
 
 
-async def format_direct_context(items: list[tuple[CanvasEdge, CanvasNode]]) -> str:
+async def format_direct_context(project: ProjectFile, items: list[tuple[CanvasEdge, CanvasNode]]) -> str:
     if not items:
         return "No direct linked context nodes."
 
     rendered_by_semantic: dict[EdgeSemantic, list[str]] = {}
     for edge, node in sorted(items, key=context_sort_key):
-        body = await compress_paragraph_reference(node) if node.type == "paragraph" else None
+        body = await compress_paragraph_reference(project, node) if node.type == "paragraph" else None
         rendered_by_semantic.setdefault(edge.semantic, []).append(node_context_text(node, body))
 
     sections: list[str] = []
     for semantic in CONTEXT_SEMANTIC_ORDER:
         rendered_items = rendered_by_semantic.get(semantic)
         if rendered_items:
-            sections.append(f"{SECTION_LABELS[semantic]}:\n" + "\n\n".join(rendered_items))
+            section_intro = ""
+            if any("Type: paragraph" in item for item in rendered_items):
+                section_intro = (
+                    "Paragraph entries in this section are continuity summaries only. "
+                    "Use them to avoid contradictions, not as content that must be repeated or imitated.\n\n"
+                )
+            if any("Type: scene" in item for item in rendered_items):
+                section_intro += (
+                    "Scene entries are strict scene sources. Follow their ordered beats and continuity when generating target paragraphs.\n\n"
+                )
+            sections.append(f"{SECTION_LABELS[semantic]}:\n" + section_intro + "\n\n".join(rendered_items))
 
     for semantic, rendered_items in rendered_by_semantic.items():
         if semantic not in CONTEXT_SEMANTIC_ORDER:

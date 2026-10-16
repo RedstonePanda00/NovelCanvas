@@ -18,7 +18,6 @@ from .models import (
 from .paths import (
     KNOWLEDGE_BASE_DIR,
     KNOWLEDGE_CHUNKS_FILE,
-    KNOWLEDGE_DOCUMENTS_DIR,
     KNOWLEDGE_INDEX_DIR,
     KNOWLEDGE_METADATA_FILE,
     LOCAL_APP_CONFIG_FILE,
@@ -66,7 +65,6 @@ def export_project() -> dict:
 
 
 def ensure_knowledge_base() -> None:
-    KNOWLEDGE_DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
     KNOWLEDGE_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
     if not KNOWLEDGE_METADATA_FILE.exists():

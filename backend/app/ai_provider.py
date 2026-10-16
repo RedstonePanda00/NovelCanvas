@@ -114,6 +114,7 @@ async def stream_chat_completion(
     model_id: str,
     messages: list[dict[str, str]],
     max_tokens: int = 2000,
+    json_response: bool = False,
 ) -> AsyncIterator[str]:
     payload = {
         "model": model_id,
@@ -122,6 +123,8 @@ async def stream_chat_completion(
         "stream": True,
         "temperature": 0.7,
     }
+    if json_response:
+        payload["response_format"] = {"type": "json_object"}
 
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(

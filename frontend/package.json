@@ -1,22 +1,33 @@
 {
   "name": "novel-canvas-frontend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "npm run build && playwright test",
+    "generate:api": "..\\.venv\\Scripts\\python.exe ..\\backend\\scripts\\generate_openapi_types.py",
+    "check:api": "..\\.venv\\Scripts\\python.exe ..\\backend\\scripts\\generate_openapi_types.py --check"
   },
   "dependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^29.1.1",
     "typescript": "^5.0.0",
-    "vite": "^7.0.0"
+    "vite": "^7.0.0",
+    "vitest": "^4.1.10"
   }
 }
