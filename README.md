@@ -28,7 +28,7 @@ The application runs entirely on your machine. Your novel project and knowledge 
 ## Requirements
 
 - **Node.js** (includes `npm`)
-- **Python 3.10+**
+- **Python 3.10 or later** (including Python 3.15.2)
 
 ## Quick start (Windows)
 
@@ -46,6 +46,10 @@ This script will:
 4. Start the backend on `http://127.0.0.1:53173`
 5. Start the frontend on `http://127.0.0.1:5173`
 6. Open the app in your browser
+
+The launcher reuses an existing `.venv`. To switch that checkout to Python 3.15,
+stop the app, rename `.venv`, then run `py -3.15 -m venv .venv` before starting
+the app again.
 
 ## Manual setup
 

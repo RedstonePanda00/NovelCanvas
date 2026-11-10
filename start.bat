@@ -8,6 +8,7 @@ set "BACKEND_PORT=53173"
 set "BACKEND_URL=http://127.0.0.1:%BACKEND_PORT%"
 set "VITE_API_BASE=%BACKEND_URL%"
 set "PYTHON_EXE=%ROOT%\.venv\Scripts\python.exe"
+set "PYTHON_CHECK=import sys; sys.exit(not ((3, 10) <= sys.version_info[:2] < (4, 0)))"
 
 cd /d "%ROOT%" || (
   echo Failed to enter project directory: %ROOT%
@@ -27,27 +28,21 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "PY_CMD="
-where py >nul 2>nul
-if not errorlevel 1 set "PY_CMD=py -3"
-if not defined PY_CMD (
-  where python >nul 2>nul
-  if not errorlevel 1 set "PY_CMD=python"
-)
-if not exist "%PYTHON_EXE%" if not defined PY_CMD (
-  echo ERROR: Python was not found. Install Python 3, then run this file again.
-  pause
-  exit /b 1
-)
-
 if not exist "%PYTHON_EXE%" (
   echo Creating Python virtual environment...
-  %PY_CMD% -m venv "%ROOT%\.venv"
+  call :create_venv
   if errorlevel 1 (
-    echo ERROR: Failed to create Python virtual environment.
     pause
     exit /b 1
   )
+)
+
+"%PYTHON_EXE%" -c "%PYTHON_CHECK%" >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: The existing .venv cannot run Python 3.10 or later.
+  echo Rename .venv and run this file again to create a new environment.
+  pause
+  exit /b 1
 )
 
 echo Checking backend dependencies...
@@ -135,6 +130,30 @@ echo Backend:  %BACKEND_URL%
 echo Frontend: %FRONTEND_URL%
 echo MCP:      %BACKEND_URL%/mcp
 exit /b 0
+
+
+:create_venv
+py -3 -c "%PYTHON_CHECK%" >nul 2>nul
+if not errorlevel 1 (
+  set "PY_CMD=py -3"
+  goto :run_venv
+)
+rem A Windows Store alias may come before a working interpreter on PATH.
+for /f "delims=" %%P in ('where.exe python.exe 2^>nul') do (
+  "%%P" -c "%PYTHON_CHECK%" >nul 2>nul
+  if not errorlevel 1 (
+    set PY_CMD="%%P"
+    goto :run_venv
+  )
+)
+echo ERROR: No working Python 3.10 or later was found. Install Python and add it to PATH.
+exit /b 1
+
+:run_venv
+%PY_CMD% -m venv "%ROOT%\.venv"
+if not errorlevel 1 exit /b 0
+echo ERROR: Failed to create Python virtual environment.
+exit /b 1
 
 
 :check_listener

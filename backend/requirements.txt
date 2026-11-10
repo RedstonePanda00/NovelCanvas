@@ -1,5 +1,8 @@
 fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.8.0
+uvicorn[standard]>=0.30.0; python_version < "3.15"
+# Uvicorn's standard extra pulls in PyYAML, which lacks Windows CPython 3.15 wheels.
+uvicorn>=0.30.0; python_version >= "3.15"
+pydantic>=2.8.0; python_version < "3.15"
+pydantic>=2.14.0; python_version >= "3.15"
 httpx>=0.27.0
 mcp>=1.26,<2
