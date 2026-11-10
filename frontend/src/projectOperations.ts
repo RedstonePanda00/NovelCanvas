@@ -1,5 +1,21 @@
-import { createWorldbookEntry } from './project';
-import type { AIGenerationPlan, ProjectFile, WorldbookEntry } from './types';
+import { createNode, createWorldbookEntry } from './project';
+import type { AIGenerationPlan, CanvasNode, ProjectFile, WorldbookEntry } from './types';
+
+export function parseWorldbookImages(payload: unknown, entries: WorldbookEntry[]): CanvasNode[] {
+  const raw = payload && typeof payload === 'object' ? (payload as Record<string, unknown>).imageNodes : undefined;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error('Invalid Worldbook image nodes.');
+  return raw.map((value, index) => {
+    if (!value || typeof value !== 'object') throw new Error('Invalid Worldbook image node.');
+    const node = value as CanvasNode;
+    if (node.type !== 'image' || typeof node.title !== 'string' || (node.body != null && typeof node.body !== 'string') ||
+      !Array.isArray(node.worldbookEntryIds) || !node.worldbookEntryIds.every(id => typeof id === 'string') ||
+      (node.image != null && (typeof node.image.fileName !== 'string' || node.image.fileName.length > 255 || typeof node.image.dataUrl !== 'string' || node.image.dataUrl.length > 2796240 || !/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/.test(node.image.dataUrl)))) {
+      throw new Error('Invalid Worldbook image node.');
+    }
+    return { ...createNode('image', index, { x: 80 + index % 4 * 380, y: 80 + Math.floor(index / 4) * 480 }), title: node.title, body: node.body, image: node.image, worldbookEntryIds: node.worldbookEntryIds.filter(id => entries.some(entry => entry.id === id)) };
+  });
+}
 
 export function applyGenerationPlan(project: ProjectFile, plan: AIGenerationPlan): ProjectFile {
   const existing = new Set(project.nodes.map((node) => node.id));

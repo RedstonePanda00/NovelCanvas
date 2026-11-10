@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useLayoutEffect, useSyncExternalStore, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api';
+import { ImageEditor } from './ImageEditor';
 import { useI18n } from './i18n';
 import {
   createNode, createEdge, edgeSemantics, fitViewport, nodeTypes, nowIso, semanticColors,
   type Viewport,
 } from './project';
 import { applyGenerationPlan } from './projectOperations';
-import { AssistantPanel, CHAT_NODE_MIME } from './AssistantPanel';
 import { WorkbenchDialog } from './WorkbenchDialog';
 import { RelationshipPicker } from './RelationshipPicker';
 import { relationshipLabels } from './relationships';
@@ -23,6 +23,7 @@ interface PointerInteraction {
   kind: 'pan' | 'node' | 'resize';
   startClient: Point;
   startViewport?: Viewport;
+  panPreview?: Viewport;
   nodeId?: string;
   startPosition?: Point;
   startSize?: { width: number; height: number };
@@ -34,13 +35,15 @@ interface PendingCompletion {
   kind: 'paragraph' | 'outline';
 }
 
+const viewportTransform = (view: Viewport) => `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
+
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
 function typeLabel(type: NodeType, locale: string) {
   if (locale === 'en') return type.replace('_', ' ');
   return ({
     paragraph: '段落', outline: '大纲', scene: '场景', character: '角色', supplemental_info: '补充资料',
-    instruction: '指令', container: '章节 / 分组',
+    instruction: '指令', image: '图片', container: '章节 / 分组',
   } satisfies Record<NodeType, string>)[type];
 }
 
@@ -55,6 +58,90 @@ function layoutPlan(plan: AIGenerationPlan, source: CanvasNode): AIGenerationPla
     })),
   };
 }
+
+type Drag = { id: string; changes: Partial<CanvasNode> };
+
+function createDragPreview() {
+  let current: Drag | null = null;
+  const listeners = new Map<string, Set<() => void>>();
+  return {
+    get: (id: string) => current?.id === id ? current.changes : null,
+    set(next: Drag | null) {
+      const old = current;
+      current = next;
+      if (old && old.id !== next?.id) listeners.get(old.id)?.forEach(notify => notify());
+      if (next) listeners.get(next.id)?.forEach(notify => notify());
+    },
+    subscribe(id: string, notify: () => void) {
+      const entries = listeners.get(id) ?? new Set();
+      entries.add(notify);
+      listeners.set(id, entries);
+      return () => { entries.delete(notify); if (!entries.size) listeners.delete(id); };
+    },
+  };
+}
+type DragPreview = ReturnType<typeof createDragPreview>;
+
+function useDragNode(node: CanvasNode, preview: DragPreview) {
+  const subscribe = useCallback((notify: () => void) => preview.subscribe(node.id, notify), [node.id, preview]);
+  const changes = useSyncExternalStore(subscribe, () => preview.get(node.id));
+  return changes ? { ...node, ...changes } : node;
+}
+
+const EdgePath = memo(function EdgePath({ edge, from, to, preview, pending, selected, locale, selectEdge }: {
+  edge: CanvasEdge; from: CanvasNode; to: CanvasNode; preview: DragPreview; pending: boolean;
+  selected: boolean; locale: string; selectEdge: (id: string) => void;
+}) {
+  const source = useDragNode(from, preview), target = useDragNode(to, preview);
+  const sx = source.position.x + source.size.width; const sy = source.position.y + 44;
+  const tx = target.position.x; const ty = target.position.y + 44;
+  const bend = Math.max(80, Math.abs(tx - sx) * 0.45);
+  const d = `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
+  return <g key={edge.id} className={`${selected ? 'selected' : ''} ${pending ? 'pending' : ''}`}>
+    <path className="edge-hit" d={d} onClick={() => !pending && selectEdge(edge.id)} />
+    <path className="edge-line" d={d} style={{ stroke: semanticColors[edge.semantic] }} markerEnd={`url(#arrow-${edge.semantic})`} />
+    {selected ? <text x={(sx + tx) / 2} y={(sy + ty) / 2 - 8}>{relationshipLabels[edge.semantic][locale === 'zh-CN' ? 0 : 1]}</text> : null}
+  </g>;
+});
+
+const NodeCard = memo(function NodeCard({ source, preview, pendingNode, selected, generating, hovered, busy,
+  completion, candidateBody, onSelect, onCompare, onAccept, onReject, updateNode, interactionRef,
+  connectionRef, setConnectSourceId, setConnectionPoint, screenToCanvas }: {
+  source: CanvasNode; preview: DragPreview; pendingNode: boolean; selected: boolean; generating: boolean;
+  hovered: boolean; busy: boolean; completion?: PendingCompletion; candidateBody?: string;
+  onSelect: (node: CanvasNode) => void; onCompare: (id: string) => void;
+  onAccept?: (node: CanvasNode) => void; onReject?: (id: string) => void;
+  updateNode: (id: string, changes: Partial<CanvasNode>) => void;
+  interactionRef: React.RefObject<PointerInteraction | null>; connectionRef: React.RefObject<string>;
+  setConnectSourceId: (id: string) => void; setConnectionPoint: (point: Point) => void;
+  screenToCanvas: (x: number, y: number) => Point;
+}) {
+  const { locale, t } = useI18n();
+  const node = useDragNode(source, preview);
+  const body = completion ? completion.text : candidateBody ?? node.body ?? '';
+  return (
+    <article key={node.id} data-node-id={node.id} className={`canvas-node type-border-${node.type} ${selected ? 'selected' : ''} ${pendingNode ? 'pending' : ''} ${generating ? 'generating' : ''} ${hovered ? 'connection-target' : ''}`}
+      style={{ left: node.position.x, top: node.position.y, width: node.size.width, minHeight: node.size.height }}
+      onPointerDown={(event) => event.stopPropagation()} onClick={() => { if (!pendingNode) { onSelect(node); } }}>
+      <header className="node-header" onPointerDown={(event) => {
+        if (pendingNode || event.button !== 0 || (event.target as HTMLElement).closest('input,button')) return;
+        event.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        document.body.classList.add('canvas-drag-active');
+        interactionRef.current = { kind: 'node', nodeId: node.id, startClient: { x: event.clientX, y: event.clientY }, startPosition: node.position };
+      }}>
+        <span className={`node-type type-${node.type}`}><span className="type-dot" />{typeLabel(node.type, locale)}</span>
+        <input aria-label={t('title')} value={node.title} disabled={Boolean(pendingNode)} onChange={(event) => updateNode(node.id, { title: event.target.value })} />
+        {!pendingNode ? <button type="button" className="connection-handle output" aria-label={locale === 'zh-CN' ? '拖出关联' : 'Drag connection'} title={locale === 'zh-CN' ? '拖到目标节点建立关联；按回车后可点击目标' : 'Drag to a target node; Enter then click a target also works'} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); connectionRef.current = node.id; setConnectSourceId(node.id); setConnectionPoint(screenToCanvas(event.clientX, event.clientY)); document.body.classList.add('canvas-drag-active'); event.currentTarget.setPointerCapture?.(event.pointerId); }} onClick={(event) => { event.stopPropagation(); if (event.detail === 0) setConnectSourceId(node.id); }}>↗</button> : null}
+      </header>
+      {node.type === 'image' ? <ImageEditor image={node.image} alt={body || node.title} disabled={pendingNode} onChange={image => updateNode(node.id, { image })} /> : null}
+      <textarea aria-label={t('body')} value={body} disabled={Boolean(pendingNode || completion || candidateBody !== undefined || generating)} placeholder={node.type === 'image' ? (locale === 'zh-CN' ? '图片说明（用于检索和文字引用）' : 'Image description for search and text references') : t('body')} onChange={(event) => updateNode(node.id, { body: event.target.value })} />
+      <input className="node-tags" aria-label={t('tags')} value={node.metadata.tags.join(', ')} disabled={Boolean(pendingNode)} placeholder={t('tags')} onChange={(event) => updateNode(node.id, { metadata: { ...node.metadata, tags: event.target.value.split(',').map((tag) => tag.trim()).filter(Boolean) } })} />
+      {candidateBody !== undefined ? <div className="pending-actions"><span>{t('planReady')}</span><button type="button" onClick={() => onCompare(node.id)}>{locale === 'zh-CN' ? '对比候选' : 'Compare candidate'}</button><button type="button" onClick={() => onAccept?.(node)} disabled={busy}>{t('accept')}</button><button type="button" onClick={() => onReject?.(node.id)} disabled={busy}>{t('reject')}</button></div> : null}
+      {!pendingNode ? <button type="button" className="resize-handle" aria-label={`Resize ${node.title}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); document.body.classList.add('canvas-drag-active'); interactionRef.current = { kind: 'resize', nodeId: node.id, startClient: { x: event.clientX, y: event.clientY }, startSize: node.size }; }} /> : null}
+    </article>
+  );
+});
 
 function MiniMap({ nodes, viewport, onFit }: { nodes: CanvasNode[]; viewport: Viewport; onFit: () => void }) {
   const { t } = useI18n();
@@ -91,20 +178,20 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
   const suppressClickRef = useRef(false);
   const generationAbortRef = useRef<AbortController | null>(null);
   const dragRef = useRef<{ id: string; changes: Partial<CanvasNode> } | null>(null);
-  const [dragPreview, setDragPreview] = useState<{ id: string; changes: Partial<CanvasNode> } | null>(null);
+  const [dragPreview] = useState(createDragPreview);
+  const worldRef = useRef<HTMLDivElement>(null);
   useEffect(() => () => { generationAbortRef.current?.abort(); }, []);
   const [viewport, setViewport] = useState<Viewport>({ x: 24, y: 24, scale: 1 });
+  const viewportRef = useRef(viewport);
+  useLayoutEffect(() => { viewportRef.current = viewport; }, [viewport]);
   const [placingType, setPlacingType] = useState<NodeType | null>(null);
   const [connectSourceId, setConnectSourceId] = useState('');
   const connectionRef = useRef<string>('');
   const [connectionPoint, setConnectionPoint] = useState<Point | null>(null);
   const [hoverTarget, setHoverTarget] = useState('');
   const [linkPair, setLinkPair] = useState<{ sourceId: string; targetId: string } | null>(null);
-  const [inspectorTab, setInspectorTab] = useState<'details' | 'assistant'>('details');
-  const [conversationsOpen, setConversationsOpen] = useState(false);
-  const chatOpened = useRef(false);
   const [candidateNodeId, setCandidateNodeId] = useState('');
-  const candidateNode = project?.nodes.find((node) => node.id === candidateNodeId);
+  const candidateNode = candidateNodeId ? project?.nodes.find(node => node.id === candidateNodeId) : undefined;
   const candidateWork = project?.workbench?.[candidateNodeId];
   const inspectedCandidate = candidateWork?.versions.find((version) => version.id === candidateWork.activeVersionId);
   const [search, setSearch] = useState('');
@@ -127,23 +214,30 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
   }, [selectedNodeId, project]);
 
 
-  const canvasNodes = useMemo(() => [...(project?.nodes ?? []).map((node) => dragPreview?.id === node.id ? { ...node, ...dragPreview.changes } : node), ...(pendingPlan?.plannedNodes ?? [])], [pendingPlan, project?.nodes, dragPreview]);
-  const canvasEdges = useMemo(() => [...(project?.edges ?? []), ...(pendingPlan?.plannedEdges ?? [])], [pendingPlan, project?.edges]);
+  const canvasNodes = useMemo(() => pendingPlan ? [...(project?.nodes ?? []), ...pendingPlan.plannedNodes] : project?.nodes ?? [], [pendingPlan, project?.nodes]);
+  const canvasEdges = useMemo(() => pendingPlan ? [...(project?.edges ?? []), ...pendingPlan.plannedEdges] : project?.edges ?? [], [pendingPlan, project?.edges]);
   const nodeById = useMemo(() => new Map(canvasNodes.map((node) => [node.id, node])), [canvasNodes]);
   const adjacency = useMemo(() => {
     const map = new Map<string, { incoming: CanvasEdge[]; outgoing: CanvasEdge[] }>();
-    for (const node of project?.nodes ?? []) map.set(node.id, { incoming: [], outgoing: [] });
+    function links(id: string) {
+      let entry = map.get(id);
+      if (!entry) { entry = { incoming: [], outgoing: [] }; map.set(id, entry); }
+      return entry;
+    }
     for (const edge of project?.edges ?? []) {
-      map.get(edge.targetNodeId)?.incoming.push(edge);
-      map.get(edge.sourceNodeId)?.outgoing.push(edge);
+      links(edge.targetNodeId).incoming.push(edge);
+      links(edge.sourceNodeId).outgoing.push(edge);
     }
     return map;
-  }, [project?.edges, project?.nodes]);
+  }, [project?.edges]);
 
-  const filteredNodes = useMemo(() => (project?.nodes ?? []).filter((node) => {
+  const filteredNodes = useMemo(() => {
+    const nodes = project?.nodes ?? [];
     const needle = search.trim().toLowerCase();
-    return (!typeFilter || node.type === typeFilter) && (!needle || `${node.title} ${node.body ?? ''} ${node.metadata.tags.join(' ')}`.toLowerCase().includes(needle));
-  }), [project?.nodes, search, typeFilter]);
+    if (!typeFilter && !needle) return nodes;
+    return nodes.filter(node => (!typeFilter || node.type === typeFilter) &&
+      (!needle || `${node.title} ${node.body ?? ''} ${node.metadata.tags.join(' ')}`.toLowerCase().includes(needle)));
+  }, [project?.nodes, search, typeFilter]);
 
   const fitAll = useCallback((nodes = canvasNodes) => {
     const rect = stageRef.current?.getBoundingClientRect();
@@ -184,8 +278,9 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
   const screenToCanvas = useCallback((clientX: number, clientY: number): Point => {
     const rect = stageRef.current?.getBoundingClientRect();
     if (!rect) return { x: 0, y: 0 };
+    const viewport = viewportRef.current;
     return { x: (clientX - rect.left - viewport.x) / viewport.scale, y: (clientY - rect.top - viewport.y) / viewport.scale };
-  }, [viewport]);
+  }, []);
 
   useEffect(() => {
     const move = (event: PointerEvent) => {
@@ -219,7 +314,9 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
       suppressClickRef.current = true;
       event.preventDefault();
       if (interaction.kind === 'pan' && interaction.startViewport) {
-        setViewport({ ...interaction.startViewport, x: interaction.startViewport.x + event.clientX - interaction.startClient.x, y: interaction.startViewport.y + event.clientY - interaction.startClient.y });
+        const view = { ...interaction.startViewport, x: interaction.startViewport.x + event.clientX - interaction.startClient.x, y: interaction.startViewport.y + event.clientY - interaction.startClient.y };
+        interaction.panPreview = view;
+        if (worldRef.current) worldRef.current.style.transform = viewportTransform(view);
       }
       if (interaction.kind === 'node' && interaction.nodeId && interaction.startPosition) {
         const position = {
@@ -227,7 +324,7 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
           y: interaction.startPosition.y + (event.clientY - interaction.startClient.y) / viewport.scale,
         };
         dragRef.current = { id: interaction.nodeId, changes: { position } };
-        setDragPreview(dragRef.current);
+        dragPreview.set(dragRef.current);
       }
       if (interaction.kind === 'resize' && interaction.nodeId && interaction.startSize) {
         const size = {
@@ -235,14 +332,15 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
           height: clamp(interaction.startSize.height + (event.clientY - interaction.startClient.y) / viewport.scale, 180, 900),
         };
         dragRef.current = { id: interaction.nodeId, changes: { size } };
-        setDragPreview(dragRef.current);
+        dragPreview.set(dragRef.current);
       }
     };
     const up = () => {
+      if (interactionRef.current?.panPreview) setViewport(interactionRef.current.panPreview);
       const drag = dragRef.current;
       if (drag) updateProject((current) => ({ ...current, nodes: current.nodes.map((node) => node.id === drag.id ? { ...node, ...drag.changes, metadata: { ...node.metadata, updatedAt: nowIso() } } : node) }));
       dragRef.current = null;
-      setDragPreview(null);
+      dragPreview.set(null);
       interactionRef.current = null;
       document.body.classList.remove('canvas-drag-active');
       const stage = stageRef.current;
@@ -259,7 +357,7 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
       window.removeEventListener('blur', up);
       document.body.classList.remove('canvas-drag-active');
     };
-  }, [updateProject, viewport.scale]);
+  }, [dragPreview, updateProject, viewport.scale]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -275,12 +373,22 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [active, fitAll, redo, saveNow, undo]);
 
-  if (!project) return <section className="empty-state">{t('loading')}</section>;
 
-  const updateNode = (nodeId: string, changes: Partial<CanvasNode>) => updateProject((current) => ({
+
+  const updateNode = useCallback((nodeId: string, changes: Partial<CanvasNode>) => updateProject((current) => ({
     ...current,
     nodes: current.nodes.map((node) => node.id === nodeId ? { ...node, ...changes, metadata: { ...(changes.metadata ?? node.metadata), updatedAt: nowIso() } } : node),
-  }));
+  })), [updateProject]);
+
+  const onNodeSelect = useCallback((target: CanvasNode) => {
+    if (!connectSourceId) { selectNode(target.id); return; }
+    if (target.id !== connectSourceId) {
+      setLinkPair({ sourceId: connectSourceId, targetId: target.id });
+      setConnectSourceId('');
+    }
+  }, [connectSourceId, selectNode]);
+
+  if (!project) return <section className="empty-state">{t('loading')}</section>;
 
   const addNode = (type: NodeType, position: Point) => {
     const node = createNode(type, project.nodes.length, position);
@@ -293,16 +401,10 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
     if (!window.confirm(t('confirmDeleteNode'))) return;
     updateProject((current) => ({
       ...current,
-      nodes: current.nodes.filter((item) => item.id !== node.id).map((item) => ({ ...item, childNodeIds: item.childNodeIds.filter((id) => id !== node.id) })),
+      nodes: current.nodes.filter(item => item.id !== node.id).map(item => item.childNodeIds.includes(node.id) ? { ...item, childNodeIds: item.childNodeIds.filter(id => id !== node.id) } : item),
       edges: current.edges.filter((edge) => edge.sourceNodeId !== node.id && edge.targetNodeId !== node.id),
     }));
     selectNode('');
-  };
-
-  const connectTo = (target: CanvasNode) => {
-    if (!connectSourceId || connectSourceId === target.id) return;
-    setLinkPair({ sourceId: connectSourceId, targetId: target.id });
-    setConnectSourceId('');
   };
 
   const refreshContext = async () => {
@@ -354,7 +456,6 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
         baseBody, feedback: `${kind} · ${mode}`, preserve: '', rationale: '',
         operation: 'replace', status: 'pending', createdAt: nowIso(),
       }), false);
-      setInspectorTab('assistant');
       setNotice(t('planReady'));
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') setNotice(t('streamCanceled'));
@@ -453,7 +554,7 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
   };
 
   return (
-    <section className={`canvas-workspace ${inspectorTab === 'assistant' ? 'with-chat' : 'chat-folded'} ${conversationsOpen ? 'with-conversations' : ''}`}>
+    <section className="canvas-workspace">
       <aside className="node-navigator">
         <div className="dock-heading"><div><span className="eyebrow">{t('canvas')}</span><h2>{t('navigator')}</h2></div></div>
         <div className="node-palette" aria-label={t('nodes')}>
@@ -476,7 +577,7 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
           {filteredNodes.map((node) => {
             const links = adjacency.get(node.id);
             return (
-              <button type="button" key={node.id} draggable onDragStart={(event) => { event.dataTransfer.setData(CHAT_NODE_MIME, node.id); event.dataTransfer.effectAllowed = 'copy'; }} className={selectedNodeId === node.id ? 'selected' : ''} onClick={() => centerNode(node)}>
+              <button type="button" key={node.id} className={selectedNodeId === node.id ? 'selected' : ''} onClick={() => centerNode(node)}>
                 <span className={`type-dot type-${node.type}`} /><span><strong>{node.title || typeLabel(node.type, locale)}</strong><small>{typeLabel(node.type, locale)} · {links?.incoming.length ?? 0}↓ {links?.outgoing.length ?? 0}↑</small></span>
               </button>
             );
@@ -538,23 +639,16 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
             <button type="button" aria-label={t('zoomOut')} onClick={() => setViewport((value) => ({ ...value, scale: clamp(value.scale / 1.12, 0.05, 2.2) }))}>−</button>
             <button type="button" aria-label={t('zoomIn')} onClick={() => setViewport((value) => ({ ...value, scale: clamp(value.scale * 1.12, 0.05, 2.2) }))}>+</button>
           </div>
-          <div className="canvas-world" style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}>
+          <div ref={worldRef} className="canvas-world" style={{ transform: viewportTransform(viewport) }}>
             <svg className="edge-layer" viewBox="-10000 -10000 20000 20000" aria-label={t('relationships')}>
               {connectSourceId && connectionPoint && nodeById.get(connectSourceId) && <path className="connection-preview" d={`M ${nodeById.get(connectSourceId)!.position.x + nodeById.get(connectSourceId)!.size.width} ${nodeById.get(connectSourceId)!.position.y + 44} L ${connectionPoint.x} ${connectionPoint.y}`} />}
               <defs>{edgeSemantics.map((semantic) => <marker key={semantic} id={`arrow-${semantic}`} markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 Z" fill={semanticColors[semantic]} /></marker>)}</defs>
               {canvasEdges.map((edge) => {
                 const source = nodeById.get(edge.sourceNodeId); const target = nodeById.get(edge.targetNodeId);
                 if (!source || !target) return null;
-                const sx = source.position.x + source.size.width; const sy = source.position.y + 44;
-                const tx = target.position.x; const ty = target.position.y + 44;
-                const bend = Math.max(80, Math.abs(tx - sx) * 0.45);
-                const d = `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
-                const pending = pendingPlan?.plannedEdges.some((item) => item.id === edge.id);
-                return <g key={edge.id} className={`${selectedEdgeId === edge.id ? 'selected' : ''} ${pending ? 'pending' : ''}`}>
-                  <path className="edge-hit" d={d} onClick={() => !pending && selectEdge(edge.id)} />
-                  <path className="edge-line" d={d} style={{ stroke: semanticColors[edge.semantic] }} markerEnd={`url(#arrow-${edge.semantic})`} />
-                  {selectedEdgeId === edge.id ? <text x={(sx + tx) / 2} y={(sy + ty) / 2 - 8}>{relationshipLabels[edge.semantic][locale === 'zh-CN' ? 0 : 1]}</text> : null}
-                </g>;
+                return <EdgePath key={edge.id} edge={edge} from={source} to={target} preview={dragPreview}
+                  selected={selectedEdgeId === edge.id} pending={Boolean(pendingPlan?.plannedEdges.some(item => item.id === edge.id))}
+                  locale={locale} selectEdge={selectEdge} />;
               })}
             </svg>
             {canvasNodes.map((node) => {
@@ -562,29 +656,13 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
               const completion = pendingCompletions[node.id];
               const work = project.workbench?.[node.id];
               const candidate = work?.versions.find((version) => version.id === work.activeVersionId && version.status === 'pending' && version.operation === 'replace');
-              const body = completion ? completion.text : candidate?.body ?? node.body ?? '';
-              return (
-                <article key={node.id} data-node-id={node.id} className={`canvas-node type-border-${node.type} ${selectedNodeId === node.id ? 'selected' : ''} ${pendingNode ? 'pending' : ''} ${generationTargetId === node.id ? 'generating' : ''} ${hoverTarget === node.id && connectSourceId !== node.id ? 'connection-target' : ''}`}
-                  style={{ left: node.position.x, top: node.position.y, width: node.size.width, minHeight: node.size.height }}
-                  onPointerDown={(event) => event.stopPropagation()} onClick={() => { if (!pendingNode) { if (connectSourceId) connectTo(node); else selectNode(node.id); } }}>
-                  <header className="node-header" onPointerDown={(event) => {
-                    if (pendingNode || event.button !== 0 || (event.target as HTMLElement).closest('input,button')) return;
-                    event.preventDefault();
-                    window.getSelection()?.removeAllRanges();
-                    document.body.classList.add('canvas-drag-active');
-                    interactionRef.current = { kind: 'node', nodeId: node.id, startClient: { x: event.clientX, y: event.clientY }, startPosition: node.position };
-                  }}>
-                    <span className={`node-type type-${node.type}`}><span className="type-dot" />{typeLabel(node.type, locale)}</span>
-                    <input aria-label={t('title')} value={node.title} disabled={Boolean(pendingNode)} onChange={(event) => updateNode(node.id, { title: event.target.value })} />
-                    {!pendingNode && <button type="button" className="chat-drag-handle" draggable aria-label={locale === 'zh-CN' ? '拖入聊天' : 'Drag into chat'} title={locale === 'zh-CN' ? '拖入右侧聊天；或点击打开聊天' : 'Drag into the right chat, or click to open it'} onDragStart={(event) => { event.dataTransfer.setData(CHAT_NODE_MIME, node.id); event.dataTransfer.effectAllowed = 'copy'; }} onClick={(event) => { event.stopPropagation(); selectNode(node.id); setInspectorTab('assistant'); }}>☷</button>}
-                    {!pendingNode ? <button type="button" className="connection-handle output" aria-label={locale === 'zh-CN' ? '拖出关联' : 'Drag connection'} title={locale === 'zh-CN' ? '拖到目标节点建立关联；按回车后可点击目标' : 'Drag to a target node; Enter then click a target also works'} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); connectionRef.current = node.id; setConnectSourceId(node.id); setConnectionPoint(screenToCanvas(event.clientX, event.clientY)); document.body.classList.add('canvas-drag-active'); event.currentTarget.setPointerCapture?.(event.pointerId); }} onClick={(event) => { event.stopPropagation(); if (event.detail === 0) setConnectSourceId(node.id); }}>↗</button> : null}
-                  </header>
-                  <textarea aria-label={t('body')} value={body} disabled={Boolean(pendingNode || completion || candidate || generationTargetId === node.id)} placeholder={t('body')} onChange={(event) => updateNode(node.id, { body: event.target.value })} />
-                  <input className="node-tags" aria-label={t('tags')} value={node.metadata.tags.join(', ')} disabled={Boolean(pendingNode)} placeholder={t('tags')} onChange={(event) => updateNode(node.id, { metadata: { ...node.metadata, tags: event.target.value.split(',').map((tag) => tag.trim()).filter(Boolean) } })} />
-                  {candidate ? <div className="pending-actions"><span>{t('planReady')}</span><button type="button" onClick={() => setCandidateNodeId(node.id)}>{locale === 'zh-CN' ? '对比候选' : 'Compare candidate'}</button><button type="button" onClick={() => acceptCompletion(node)} disabled={Boolean(generationTargetId)}>{t('accept')}</button><button type="button" onClick={() => rejectCompletion(node.id)} disabled={Boolean(generationTargetId)}>{t('reject')}</button></div> : null}
-                  {!pendingNode ? <button type="button" className="resize-handle" aria-label={`Resize ${node.title}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); document.body.classList.add('canvas-drag-active'); interactionRef.current = { kind: 'resize', nodeId: node.id, startClient: { x: event.clientX, y: event.clientY }, startSize: node.size }; }} /> : null}
-                </article>
-              );
+              return <NodeCard key={node.id} source={node} preview={dragPreview} pendingNode={Boolean(pendingNode)}
+                selected={selectedNodeId === node.id} generating={generationTargetId === node.id}
+                hovered={hoverTarget === node.id && connectSourceId !== node.id} busy={Boolean(candidate && generationTargetId)}
+                completion={completion} candidateBody={candidate?.body} onSelect={onNodeSelect} onCompare={setCandidateNodeId}
+                onAccept={candidate ? acceptCompletion : undefined} onReject={candidate ? rejectCompletion : undefined}
+                updateNode={updateNode} interactionRef={interactionRef} connectionRef={connectionRef}
+                setConnectSourceId={setConnectSourceId} setConnectionPoint={setConnectionPoint} screenToCanvas={screenToCanvas} />;
             })}
           </div>
           {!canvasNodes.length ? <div className="canvas-empty"><strong>{t('emptyCanvas')}</strong><span>{t('addNodeHint')}</span></div> : null}
@@ -636,10 +714,6 @@ export function CanvasWorkspace({ active = true }: { active?: boolean }) {
         </> : <div className="inspector-empty"><span>◇</span><p>{t('noSelection')}</p></div>}
         </div>
       </aside>
-      <aside className="chat-sidebar"><AssistantPanel node={selectedNode} generationBusy={Boolean(generationTargetId)} expanded={inspectorTab === 'assistant'} conversationsOpen={conversationsOpen} onToggleConversations={() => setConversationsOpen((open) => !open)} onToggle={() => {
-        if (inspectorTab === 'details' && !chatOpened.current) { setConversationsOpen(window.innerWidth > 1100); chatOpened.current = true; }
-        setInspectorTab((tab) => tab === 'assistant' ? 'details' : 'assistant');
-      }} /></aside>
       {candidateNode && inspectedCandidate && <WorkbenchDialog className="version-dialog" label={locale === 'zh-CN' ? '生成候选对比' : 'Generation candidate comparison'} onClose={() => setCandidateNodeId('')}>
         <header><h2>{candidateNode.title}</h2><button onClick={() => setCandidateNodeId('')}>{locale === 'zh-CN' ? '关闭' : 'Close'}</button></header>
         <div className="version-comparison"><pre>{inspectedCandidate.baseBody}</pre><pre>{inspectedCandidate.body}</pre></div>

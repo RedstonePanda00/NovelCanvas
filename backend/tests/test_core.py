@@ -27,7 +27,6 @@ from backend.app.models import Worldbook, WorldbookEntry  # noqa: E402
 from backend.app import paragraph_generation, node_completion, structure_plans  # noqa: E402
 from backend.app.context_assembly import compress_paragraph_reference  # noqa: E402
 from backend.app.worldbook import collect_worldbook_entries, format_worldbook_context  # noqa: E402
-from backend.app.assistant_workbench import AssistantRequest, build_messages, selected_context, run_assistant  # noqa: E402
 from backend.app.models import AIProviderConfig, LocalAppConfig, RegisteredModel  # noqa: E402
 
 
@@ -44,6 +43,50 @@ def node(node_id: str, node_type: str, title: str, body: str = "") -> CanvasNode
 
 
 class CoreTests(unittest.TestCase):
+    def test_cached_project_tracks_disk_and_failed_writes(self):
+        from backend.app import stores, runtime_mcp
+        with tempfile.TemporaryDirectory() as directory, patch.object(stores, "PROJECT_FILE", Path(directory) / "p.json"):
+            base = stores.write_project(ProjectFile(nodes=[node("p", "paragraph", "Original", "alpha")]))
+            with patch.object(stores, "atomic_write_json", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    runtime_mcp.patch_node(base.updatedAt, "p", "alpha", "beta")
+            self.assertEqual(stores.read_project().nodes[0].body, "alpha")
+            stores.PROJECT_FILE.write_text('{"title":"Replacement on disk"}', encoding="utf-8")
+            self.assertEqual(stores.read_project().title, "Replacement on disk")
+
+    def test_memory_chunks_and_fingerprint_ignore_canvas_layout(self):
+        from backend.app.rag import _chunk_text
+        short = "\n\n".join(["paragraph" * 9] * 5)
+        self.assertEqual(_chunk_text(short), [short])
+        long = "x" * 1500 + "\n\n" + "y" * 1500
+        chunks = _chunk_text(long)
+        self.assertTrue(all(len(chunk) <= 1200 for chunk in chunks))
+        self.assertLessEqual(len(chunks), 5)
+        target = node("p", "paragraph", "Title", short)
+        project = ProjectFile(nodes=[target])
+        before = project_memory_fingerprint(project)
+        target.position.x += 200
+        target.metadata.updatedAt = "moved"
+        self.assertEqual(before, project_memory_fingerprint(project))
+
+    def test_reindex_embeds_only_changed_text(self):
+        from backend.app import rag
+        proj = ProjectFile(nodes=[node("a", "paragraph", "First", "alpha"),
+                                  node("b", "scene", "Second", "beta")])
+        proj.settings.modelRouting.embeddingModelId = "test-reuse"
+        async def embed(_, texts):
+            return [[1.0] for _ in texts], None
+        with patch.object(rag, "_embedding_model_config", return_value=("test-reuse", "model", None)), \
+                patch.object(rag, "_embed_texts", new=AsyncMock(side_effect=embed)) as mocked:
+            asyncio.run(rag.reindex_knowledge_base(proj))
+            proj.nodes[0].body = "changed"
+            asyncio.run(rag.reindex_knowledge_base(proj))
+            self.assertEqual(len(mocked.call_args.args[1]), 1)
+            self.assertIn("changed", mocked.call_args.args[1][0])
+            asyncio.run(rag.reindex_knowledge_base(proj))
+            self.assertEqual(mocked.await_count, 2)
+
+
     def test_storage_is_isolated_before_import(self) -> None:
         from backend.app.paths import PROJECT_FILE, KNOWLEDGE_BASE_DIR, LOCAL_APP_CONFIG_FILE
         self.assertTrue(PROJECT_FILE.is_relative_to(_test_environment.ROOT))
@@ -154,11 +197,6 @@ class WorldbookPromptTests(unittest.TestCase):
         messages = asyncio.run(node_completion._messages(self.project, outline, [(self.edge, self.scene)]))
         self.assertIn("Do not promote incidental reference details into mandatory scene beats", messages[0]["content"])
 
-    def test_chat_reports_are_not_manuscript_edits(self) -> None:
-        messages, _ = build_messages(AssistantRequest(project=self.project, targetNodeId=self.scene.id, action="agent", message="Review the scene and produce a report"))
-        self.assertIn('"blocks"', messages[0]["content"])
-        self.assertIn('return edits=[] unless', messages[0]["content"])
-
     def test_compression_keeps_action_constraints_without_portrait_templates(self) -> None:
         prior = node("prior", "paragraph", "Previous", "Aster's violet eyes gleamed. His injured hand could not grip the latch.")
         routed = SimpleNamespace(provider=object(), registered=SimpleNamespace(id="model", modelId="model"))
@@ -172,42 +210,10 @@ class WorldbookPromptTests(unittest.TestCase):
         self.assertIn("injured hand", result)
 
 
-class AssistantWorkbenchTests(unittest.TestCase):
+class LegacyProjectTests(unittest.TestCase):
     def setUp(self) -> None:
         self.target = node("target", "scene", "Negotiation", "Aster negotiates.")
         self.reference = node("ref", "character", "Aster", "Aster is cautious.")
-        self.unrelated = node("private", "paragraph", "Unselected", "DO NOT INCLUDE THIS")
-        self.project = ProjectFile(nodes=[self.target, self.reference, self.unrelated], worldbook=Worldbook(entries=[WorldbookEntry(id="lore", title="Aster", keys=["Aster"], content="Violet eyes")]))
-        self.request = AssistantRequest(project=self.project, targetNodeId="target", referenceNodeIds=["ref"], message="Make the reply shorter", action="revise", baseText="Candidate v1", preserve="Keep the ending")
-
-    def test_scope_is_explicit_and_candidate_is_separate_from_canon(self) -> None:
-        messages, context = build_messages(self.request)
-        payload = json.loads(messages[-1]["content"])
-        self.assertEqual(payload["BASE VERSION"], "Candidate v1")
-        self.assertEqual(payload["MUST PRESERVE"], "Keep the ending")
-        self.assertEqual([item.id for item in context.nodes], ["target", "ref"])
-        self.assertEqual([item.id for item in context.worldbook], ["lore"])
-        self.assertNotIn("DO NOT INCLUDE THIS", json.dumps(messages))
-        self.assertEqual(self.target.body, "Aster negotiates.")
-
-    def test_excluded_lore_and_missing_references(self) -> None:
-        self.request.excludedWorldbookIds = ["lore"]
-        self.assertEqual(selected_context(self.request)[2].worldbook, [])
-        self.request.referenceNodeIds.append("deleted")
-        with self.assertRaises(ValueError):
-            selected_context(self.request)
-
-    def test_global_chat_route_and_structured_candidate(self) -> None:
-        config = LocalAppConfig(chatModelId="chat", providers=[AIProviderConfig(id="p", name="P", baseUrl="https://example.test/v1", apiKey="test")], registeredModels=[RegisteredModel(id="chat", providerId="p", modelId="chat-model", displayName="Chat", capabilityTags=["text"])])
-        completion = AsyncMock(return_value=json.dumps({"reply": "Shortened the dialogue.", "proposal": {"title": "Negotiation", "body": "New candidate"}}))
-        with patch("backend.app.assistant_workbench.read_local_app_config", return_value=config), patch("backend.app.assistant_workbench.create_chat_completion", new=completion):
-            response = asyncio.run(run_assistant(self.request))
-            self.assertEqual(response.proposal.body, "New candidate")
-            self.assertEqual(completion.call_args.args[1], "chat-model")
-            self.request.action = "discuss"
-            response = asyncio.run(run_assistant(self.request))
-            self.assertIsNone(response.proposal)
-        self.assertEqual(self.project.nodes[0].body, "Aster negotiates.")
 
     def test_legacy_projects_default_to_empty_workbench(self) -> None:
         self.assertEqual(ProjectFile.model_validate({"title": "Legacy"}).workbench, {})
@@ -226,56 +232,6 @@ class AssistantWorkbenchTests(unittest.TestCase):
         self.assertEqual(ProjectFile.model_validate(project.model_dump()), project)
         self.assertEqual(data["nodes"][0]["type"], "review")
 
-    def test_report_blocks_validate_and_do_not_require_node_edits(self) -> None:
-        config = LocalAppConfig(chatModelId="chat", providers=[AIProviderConfig(id="p", name="P", baseUrl="https://example.test/v1", apiKey="test")], registeredModels=[RegisteredModel(id="chat", providerId="p", modelId="chat-model", displayName="Chat", capabilityTags=["text"])])
-        self.request.action = "agent"
-        completion = AsyncMock(return_value=json.dumps({"reply": "Here is the report", "blocks": [{"title": "Continuity", "body": "The scene contradicts the earlier promise."}], "edits": []}))
-        with patch("backend.app.assistant_workbench.read_local_app_config", return_value=config), patch("backend.app.assistant_workbench.create_chat_completion", new=completion):
-            response = asyncio.run(run_assistant(self.request))
-            self.assertEqual(response.blocks[0].title, "Continuity")
-            self.assertEqual(response.edits, [])
-            completion.return_value = json.dumps({"reply": "Report", "blocks": [{"title": " ", "body": "x"}]})
-            with self.assertRaises(HTTPException):
-                asyncio.run(run_assistant(self.request))
-
-    def test_agent_reads_one_incoming_layer_and_requires_expansion(self) -> None:
-        self.project.edges = [CanvasEdge(id="a", sourceNodeId="ref", targetNodeId="target", semantic="reference"), CanvasEdge(id="b", sourceNodeId="private", targetNodeId="ref", semantic="reference")]
-        self.request.action = "agent"
-        self.request.referenceNodeIds = []
-        messages, context = build_messages(self.request)
-        self.assertEqual([item.id for item in context.nodes], ["target", "ref"])
-        self.assertNotIn("DO NOT INCLUDE THIS", json.dumps(messages))
-        self.assertEqual(len(context.relationships), 1)
-        self.request.referenceNodeIds = ["private"]
-        messages, context = build_messages(self.request)
-        self.assertIn("DO NOT INCLUDE THIS", json.dumps(messages))
-        self.assertEqual(json.loads(messages[-1]["content"])["writableTargetIds"], ["target"])
-
-    def test_agent_validates_write_scope_types_and_duplicate_edits(self) -> None:
-        config = LocalAppConfig(chatModelId="chat", providers=[AIProviderConfig(id="p", name="P", baseUrl="https://example.test/v1", apiKey="test")], registeredModels=[RegisteredModel(id="chat", providerId="p", modelId="chat-model", displayName="Chat", capabilityTags=["text"])])
-        self.request.action = "agent"
-        edit = {"targetNodeId": "target", "operation": "replace", "nodeType": "scene", "title": "Scene", "body": "Changed"}
-        completion = AsyncMock()
-        with patch("backend.app.assistant_workbench.read_local_app_config", return_value=config), patch("backend.app.assistant_workbench.create_chat_completion", new=completion):
-            for edits in [[{**edit, "targetNodeId": "ref"}], [edit, edit], [{**edit, "nodeType": "paragraph"}], [{**edit, "body": " "}], [{**edit, "operation": "create", "nodeType": "container"}]]:
-                completion.return_value = json.dumps({"reply": "Done", "edits": edits})
-                with self.assertRaises(HTTPException):
-                    asyncio.run(run_assistant(self.request))
-            completion.return_value = json.dumps({"reply": "Reason", "edits": [edit]})
-            self.assertEqual(asyncio.run(run_assistant(self.request)).edits[0].body, "Changed")
-            self.assertEqual(self.target.body, "Aster negotiates.")
-            completion.return_value = json.dumps({"reply": "Discussing only", "edits": []})
-            self.assertEqual(asyncio.run(run_assistant(self.request)).edits, [])
-
-    def test_agent_can_discuss_without_reading_unattached_nodes(self) -> None:
-        request = AssistantRequest(project=self.project, targetNodeId="", action="agent", message="Discuss an idea")
-        messages, context = build_messages(request)
-        self.assertEqual(context.nodes, [])
-        self.assertEqual(context.worldbook, [])
-        self.assertEqual(json.loads(messages[-1]["content"])["writableTargetIds"], [])
-        self.assertNotIn("DO NOT INCLUDE THIS", json.dumps(messages))
-
-
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -285,6 +241,75 @@ class ApiTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls._client_context.__exit__(None, None, None)
+
+    def test_model_roles_are_local_defaults_for_new_projects(self):
+        from backend.app import stores
+        from backend.app.models import ModelRoutingSettings
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(stores, "PROJECT_FILE", Path(directory) / "project.json"), \
+                patch.object(stores, "LOCAL_APP_CONFIG_FILE", Path(directory) / "config.json"):
+            legacy = ProjectFile()
+            legacy.settings.modelRouting.structureDerivationModelId = "writer"
+            stores.write_project(legacy)
+            stores.initialize_storage()
+            models = [RegisteredModel(id=id, providerId="p", modelId=id, displayName=id,
+                                      capabilityTags=tags) for id, tags in (("writer", ["text"]), ("embed", ["embedding"]))]
+            stores.write_local_app_config(LocalAppConfig(registeredModels=models))
+
+            def new():
+                response = self.client.post("/api/project/new", json={"title": "New"})
+                self.assertEqual(response.status_code, 200)
+                return ProjectFile.model_validate(response.json())
+
+            first = new()
+            self.assertEqual(first.settings.modelRouting.structureDerivationModelId, "writer")
+            first.settings.modelRouting.embeddingModelId = "embed"
+            self.assertEqual(self.client.put("/api/project", json=first.model_dump()).status_code, 200)
+            imported = ProjectFile()
+            imported.settings.modelRouting = ModelRoutingSettings(paragraphGenerationModelId="other")
+            result = self.client.post("/api/project/import", json=imported.model_dump())
+            self.assertEqual(result.json()["settings"]["modelRouting"]["paragraphGenerationModelId"], "other")
+            stores.initialize_storage()
+            second = new()
+            self.assertEqual(second.settings.modelRouting, first.settings.modelRouting)
+            second.settings.modelRouting.embeddingModelId = None
+            self.assertEqual(self.client.put("/api/project", json=second.model_dump()).status_code, 200)
+            models[0].enabled = False
+            stores.write_local_app_config(LocalAppConfig(registeredModels=models))
+            self.assertEqual(new().settings.modelRouting, ModelRoutingSettings())
+
+    def test_runtime_tools_share_canvas_storage_and_reject_stale_writes(self) -> None:
+        headers = {"host": "127.0.0.1:53173", "accept": "application/json, text/event-stream"}
+
+        def rpc(method, params):
+            response = self.client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["result"]
+
+        def call(name, **arguments):
+            return rpc("tools/call", {"name": name, "arguments": arguments})
+
+        hello = rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                                   "clientInfo": {"name": "test", "version": "1"}})
+        self.assertEqual(hello["serverInfo"]["name"], "NovelCanvas")
+        self.assertIn("patch_node", [tool["name"] for tool in rpc("tools/list", {})["tools"]])
+        base = self.client.put("/api/project", json={"title": "Runtime fixture"}).json()
+        response = self.client.get("/api/project", headers={"X-Project-Revision": base["updatedAt"]})
+        self.assertEqual(response.status_code, 304)
+        self.assertEqual(response.content, b"")
+        created = call("create_node", revision=base["updatedAt"], node_type="scene",
+                       title="Arrival", body="An unopened letter.")["structuredContent"]
+        read = call("read_node", node_id=created["id"])["structuredContent"]
+        self.assertEqual(read["body"], "An unopened letter.")
+        args = {"revision": read["revision"], "node_id": created["id"],
+                "old_text": "unopened", "new_text": "opened"}
+        self.assertFalse(call("patch_node", **args)["isError"])
+        self.assertTrue(call("patch_node", **args)["isError"])
+        self.assertEqual(self.client.put("/api/project", headers={"X-Project-Revision": base["updatedAt"]},
+                                         json=base).status_code, 409)
+        self.assertEqual(self.client.get("/api/project").json()["nodes"][0]["body"], "An opened letter.")
 
     def test_context_endpoint_accepts_project_snapshot(self) -> None:
         target = node("target", "paragraph", "Target")
@@ -309,16 +334,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(restored["activeChatId"], "__chat__:second")
         self.assertEqual(restored["workbench"]["__chat__:second"]["draft"], "Keep this idea")
         self.assertEqual(restored["workbench"]["__chat__:second"]["title"], "Character design")
-
-    def test_global_chat_selection_validates_model_and_preserves_provider_config(self) -> None:
-        self.client.post("/api/providers/register", json={"id": "chat-provider", "name": "Chat", "baseUrl": "https://example.test/v1", "apiKey": "secret-chat", "headers": {}})
-        self.client.post("/api/models/register", json={"providerId": "chat-provider", "modelId": "text", "capabilityTags": ["text"]})
-        response = self.client.put("/api/assistant/model", json={"modelId": "chat-provider:text"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["chatModelId"], "chat-provider:text")
-        self.assertNotIn("secret-chat", response.text)
-        self.assertEqual(find_provider("chat-provider").apiKey, "secret-chat")
-        self.assertEqual(self.client.put("/api/assistant/model", json={"modelId": "missing"}).status_code, 400)
 
     def test_removed_document_and_secret_endpoints_are_unavailable(self) -> None:
         self.assertEqual(self.client.post("/api/knowledge/documents", json={}).status_code, 404)

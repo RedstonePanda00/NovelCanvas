@@ -7,6 +7,7 @@ export type NodeType =
   | 'character'
   | 'supplemental_info'
   | 'instruction'
+  | 'image'
   | 'container';
 
 export type EdgeSemantic =
@@ -65,6 +66,13 @@ export interface CanvasNode {
   targetWordCount?: number | null;
   narrativeTask?: string | null;
   childNodeIds: string[];
+  image?: ImageAttachment | null;
+  worldbookEntryIds?: string[];
+}
+
+export interface ImageAttachment {
+  dataUrl: string;
+  fileName: string;
 }
 
 export interface CanvasEdge {
@@ -231,40 +239,6 @@ export interface AgentRun {
   activities: AgentActivity[];
   status: 'running' | 'paused' | 'failed' | 'completed';
   error?: string;
-}
-
-export interface AssistantRequest {
-  project: ProjectFile;
-  scope?: 'attached' | 'project';
-  checkpoint?: Record<string, unknown> | null;
-  targetNodeId: string;
-  targetNodeIds?: string[];
-  referenceNodeIds: string[];
-  includeWorldbook: boolean;
-  excludedWorldbookIds?: string[];
-  action: 'discuss' | 'revise' | 'create' | 'agent';
-  message: string;
-  preserve?: string;
-  baseText?: string;
-  outputType?: NodeType;
-  history: Array<{ role: 'user' | 'assistant'; content: string }>;
-}
-
-export interface AssistantContext {
-  nodes: Array<{ id: string; title: string; content: string }>;
-  worldbook: Array<{ id: string; title: string; content: string }>;
-  relationships?: Array<{ sourceNodeId: string; targetNodeId: string; semantic: string }>;
-}
-
-export interface AssistantResponse {
-  reply: string;
-  blocks?: ChatBlock[];
-  proposal?: { title: string; body: string } | null;
-  edits?: Array<{ targetNodeId: string; operation: 'replace' | 'create'; title: string; body: string; nodeType: NodeType; baseBody?: string; baseTitle?: string | null; proposedNodeId?: string | null; creationSourceNodeIds?: string[] }>;
-  context: AssistantContext;
-  coverage?: { projectNodes: number; readNodes: number; planned: number; completed: number };
-  mutations?: Array<Pick<AgentMutation, 'kind' | 'targetId' | 'before' | 'after' | 'index'>>;
-  preconditions?: AgentPreconditions;
 }
 
 export interface AgentPreconditions {

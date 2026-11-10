@@ -6,8 +6,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from backend.app.assistant_stream import stream_assistant
-from backend.app.assistant_workbench import AssistantRequest
 from backend.app.json_stream import partial_json
 from backend.app.models import AIProviderConfig, CanvasNode, LocalAppConfig, NodeMetadata, Point, ProjectFile, RegisteredModel, Size
 from backend.app.scene_stream import SceneStreamRequest, stream_scenes
@@ -28,29 +26,6 @@ class StreamingTests(unittest.TestCase):
                 value["reply"].encode("utf-8")
                 self.assertTrue(payload["reply"].startswith(value["reply"]))
         self.assertEqual(partial_json(raw), payload)
-
-    def test_chat_yields_preview_before_final_validation(self):
-        config = LocalAppConfig(chatModelId="m", providers=[AIProviderConfig(id="p", name="P", baseUrl="https://example.test", apiKey="")], registeredModels=[RegisteredModel(id="m", providerId="p", modelId="model", displayName="Model", capabilityTags=["text"])])
-        completed = False
-
-        async def chunks(*args, **kwargs):
-            nonlocal completed
-            self.assertTrue(kwargs["json_response"])
-            yield '{"reply":"Working'
-            yield ' on it","blocks":[{"title":"Report","body":"Finding"}],"edits":[]}'
-            completed = True
-
-        async def run():
-            response = stream_assistant(AssistantRequest(project=outline_project(), targetNodeId="outline", action="agent", message="Review"))
-            first = json.loads(await anext(response.body_iterator))
-            self.assertEqual(first["reply"], "Working")
-            self.assertFalse(completed)
-            remaining = [json.loads(item) async for item in response.body_iterator]
-            self.assertEqual(remaining[-1]["type"], "done")
-            self.assertEqual(remaining[-1]["response"]["blocks"][0]["body"], "Finding")
-
-        with patch("backend.app.assistant_stream.read_local_app_config", return_value=config), patch("backend.app.assistant_stream.stream_chat_completion", new=chunks):
-            asyncio.run(run())
 
     def test_scene_stream_fills_exact_count_and_rejects_incomplete_output(self):
         routed = SimpleNamespace(provider=object(), registered=SimpleNamespace(id="m", modelId="model", contextWindowTokens=None))
@@ -75,6 +50,32 @@ class StreamingTests(unittest.TestCase):
             events = asyncio.run(collect())
             self.assertEqual(events[-1]["type"], "error")
             self.assertFalse(any(event["type"] == "done" for event in events))
+
+    def test_scene_delta_offsets_and_traffic(self):
+        scene = {"type": "scene", "title": "Test", "body": "舟😀" * 2500}
+        raw = json.dumps({"nodes": [scene]}, ensure_ascii=False)
+        async def chunks(*args, **kwargs):
+            for i in range(0, len(raw), 16):
+                yield raw[i:i + 16]
+
+        async def collect():
+            request = SceneStreamRequest(project=outline_project(), sourceNodeIds=["outline"], desiredCount=1, deltaPreview=True)
+            return [line async for line in stream_scenes(request).body_iterator]
+        routed = SimpleNamespace(provider=object(), registered=SimpleNamespace(id="m", modelId="m", contextWindowTokens=None))
+        with patch("backend.app.scene_stream.resolve_routed_model", return_value=routed), patch("backend.app.scene_stream.stream_chat_completion", new=chunks):
+            lines = asyncio.run(collect())
+        preview = {"title": "", "body": ""}
+        for line in lines[:-1]:
+            event = json.loads(line)
+            self.assertEqual(event["type"], "delta")
+            for change in event["changes"]:
+                field = change["field"]
+                self.assertEqual(change["offset"], len(preview[field].encode("utf-16-le")) // 2)
+                preview[field] += change["text"]
+        self.assertTrue(scene["body"].startswith(preview["body"]))
+        self.assertGreater(len(preview["body"]), 4000)
+        self.assertLess(sum(map(len, lines)), 150000)
+        self.assertEqual(json.loads(lines[-1])["nodes"][0]["body"], scene["body"])
 
     def test_project_keeps_only_latest_reports_and_latest_edit_batch_per_conversation(self):
         project = outline_project().model_dump()

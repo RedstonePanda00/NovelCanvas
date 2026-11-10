@@ -4,7 +4,9 @@ setlocal EnableExtensions
 set "ROOT=%~dp0"
 set "ROOT=%ROOT:~0,-1%"
 set "FRONTEND_URL=http://127.0.0.1:5173"
-set "BACKEND_URL=http://127.0.0.1:8000"
+set "BACKEND_PORT=53173"
+set "BACKEND_URL=http://127.0.0.1:%BACKEND_PORT%"
+set "VITE_API_BASE=%BACKEND_URL%"
 set "PYTHON_EXE=%ROOT%\.venv\Scripts\python.exe"
 
 cd /d "%ROOT%" || (
@@ -32,7 +34,7 @@ if not defined PY_CMD (
   where python >nul 2>nul
   if not errorlevel 1 set "PY_CMD=python"
 )
-if not defined PY_CMD (
+if not exist "%PYTHON_EXE%" if not defined PY_CMD (
   echo ERROR: Python was not found. Install Python 3, then run this file again.
   pause
   exit /b 1
@@ -49,7 +51,7 @@ if not exist "%PYTHON_EXE%" (
 )
 
 echo Checking backend dependencies...
-"%PYTHON_EXE%" -c "import fastapi, uvicorn" >nul 2>nul
+"%PYTHON_EXE%" -c "from backend.app.main import app" >nul 2>nul
 if errorlevel 1 (
   echo Installing backend dependencies...
   "%PYTHON_EXE%" -m pip install -r "%ROOT%\backend\requirements.txt"
@@ -86,23 +88,44 @@ if not exist "%ROOT%\frontend\node_modules\.bin\vite.cmd" (
 echo.
 echo Starting backend and frontend...
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" >nul 2>nul
-if errorlevel 1 (
-  start "Novel Canvas Backend" /D "%ROOT%" cmd /k ""%PYTHON_EXE%" -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload"
+call :check_listener %BACKEND_PORT% "%BACKEND_URL%" Backend
+if errorlevel 2 (
+  echo ERROR: Cannot safely use backend port %BACKEND_PORT%. Check the listener or port conflict.
+  pause
+  exit /b 1
+)
+if not errorlevel 1 (
+  start "Novel Canvas Backend" /D "%ROOT%" cmd /k ""%PYTHON_EXE%" -m uvicorn backend.app.main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload"
 ) else (
   echo Backend already appears to be running on %BACKEND_URL%.
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" >nul 2>nul
-if errorlevel 1 (
-  start "Novel Canvas Frontend" /D "%ROOT%\frontend" cmd /k "npm run dev -- --port 5173"
+call :check_listener 5173 "%FRONTEND_URL%" Frontend
+if errorlevel 2 (
+  echo ERROR: Cannot safely use frontend port 5173. Check the listener or port conflict.
+  pause
+  exit /b 1
+)
+if not errorlevel 1 (
+  start "Novel Canvas Frontend" /D "%ROOT%\frontend" cmd /k "npm run dev -- --port 5173 --strictPort"
 ) else (
   echo Frontend already appears to be running on %FRONTEND_URL%.
 )
 
-echo Waiting for frontend...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline=(Get-Date).AddSeconds(45); while((Get-Date) -lt $deadline){ try { $r=Invoke-WebRequest -UseBasicParsing -Uri '%FRONTEND_URL%' -TimeoutSec 2; if($r.StatusCode -ge 200 -and $r.StatusCode -lt 500){ exit 0 } } catch {}; Start-Sleep -Milliseconds 500 }; exit 1" >nul 2>nul
+echo Waiting for Novel Canvas...
+for /l %%i in (1,1,45) do (
+  call :check_listener %BACKEND_PORT% "%BACKEND_URL%" Backend
+  if not errorlevel 2 if errorlevel 1 (
+    call :check_listener 5173 "%FRONTEND_URL%" Frontend
+    if not errorlevel 2 if errorlevel 1 goto :ready
+  )
+  timeout /t 1 /nobreak >nul
+)
+echo ERROR: Novel Canvas did not become ready. See the service terminals.
+pause
+exit /b 1
 
+:ready
 echo Opening %FRONTEND_URL% ...
 start "" "%FRONTEND_URL%"
 
@@ -110,6 +133,11 @@ echo.
 echo Novel Canvas is starting.
 echo Backend:  %BACKEND_URL%
 echo Frontend: %FRONTEND_URL%
-echo You can close this window.
-echo.
-pause
+echo MCP:      %BACKEND_URL%/mcp
+exit /b 0
+
+
+:check_listener
+rem 0 = free, 1 = our loopback service, 2 = conflicting or unverifiable listener.
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; try { $listeners = @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq %~1 }); if (!$listeners.Count) { exit 0 }; foreach ($listener in $listeners) { if (![Net.IPAddress]::IsLoopback($listener.Address)) { exit 2 } }; if ('%~3' -eq 'Backend') { $health = Invoke-RestMethod -MaximumRedirection 0 -Uri '%~2/health' -TimeoutSec 3; if ($health.service -eq 'novelcanvas') { exit 1 } } else { $page = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri '%~2/' -TimeoutSec 3; if ($page.Content.Contains('<title>Novel Canvas</title>')) { exit 1 } }; exit 2 } catch { exit 2 }"
+exit /b %errorlevel%

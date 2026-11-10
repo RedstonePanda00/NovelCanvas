@@ -6,7 +6,7 @@ import { ProjectStoreProvider, useProjectStore } from '../src/projectStore';
 import { I18nProvider } from '../src/i18n';
 import { createEmptyProject, createNode } from '../src/project';
 
-const mocks = vi.hoisted(() => ({ getAppConfig: vi.fn(async () => ({ providers: [], registeredModels: [] })), saveProject: vi.fn(async (p) => p), assistantContext: vi.fn(async () => ({ nodes: [], worldbook: [] })), previewContext: vi.fn(), streamParagraphGeneration: vi.fn() }));
+const mocks = vi.hoisted(() => ({ getAppConfig: vi.fn(async () => ({ providers: [], registeredModels: [] })), saveProject: vi.fn(async (p) => p), previewContext: vi.fn(), streamParagraphGeneration: vi.fn() }));
 vi.mock('../src/api', () => ({ api: mocks }));
 const a = createNode('paragraph', 0, { x: 0, y: 0 }); a.title = 'Alpha';
 const b = createNode('paragraph', 1, { x: 500, y: 0 }); b.title = 'Beta';

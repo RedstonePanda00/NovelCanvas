@@ -44,11 +44,15 @@ def _chunk_text(text: str, max_chars: int = 1200, overlap_chars: int = 160) -> l
     cursor = 0
     while cursor < len(clean):
         end = min(len(clean), cursor + max_chars)
-        split_at = clean.rfind("\n\n", cursor, end)
-        if split_at <= cursor:
-            split_at = clean.rfind("\n", cursor, end)
-        if split_at <= cursor:
-            split_at = end
+        split_at = end
+        if end < len(clean):
+            # A boundary inside the overlap would emit the same prefix again.
+            lower = cursor + overlap_chars + 1
+            boundary = clean.rfind("\n\n", lower, end)
+            if boundary < 0:
+                boundary = clean.rfind("\n", lower, end)
+            if boundary >= 0:
+                split_at = boundary
 
         chunk = clean[cursor:split_at].strip()
         if chunk:
@@ -95,7 +99,6 @@ def project_memory_fingerprint(project: ProjectFile) -> str:
             "title": node.title,
             "body": node.body or "",
             "tags": node.metadata.tags,
-            "updatedAt": node.metadata.updatedAt,
         }
         for node in _project_memory_nodes(project)
     ]
@@ -196,20 +199,26 @@ async def reindex_knowledge_base(project: ProjectFile) -> KnowledgeReindexResult
         write_knowledge_index(KnowledgeIndex())
         return KnowledgeReindexResult(indexedChunks=0, embeddingModelId=embedding_model_id, unavailableReason="Project memory has no node body text to index.")
 
-    embeddings, error = await _embed_texts(project, [chunk.text for chunk in chunk_models])
+    cached = {entry.textHash: entry.vector for entry in read_knowledge_index().entries
+              if entry.embeddingModelId == embedding_model_id and entry.textHash}
+    hashes = [hashlib.sha256(chunk.text.encode("utf-8")).hexdigest() for chunk in chunk_models]
+    missing = {key: chunk.text for key, chunk in zip(hashes, chunk_models, strict=True) if key not in cached}
+    embeddings, error = await _embed_texts(project, list(missing.values())) if missing else ([], None)
     if error:
         write_knowledge_index(KnowledgeIndex())
         return KnowledgeReindexResult(indexedChunks=0, embeddingModelId=embedding_model_id, unavailableReason=error)
 
+    cached.update(zip(missing, embeddings, strict=True))
     index = KnowledgeIndex(
         entries=[
             KnowledgeIndexEntry(
                 chunkId=chunk.id,
                 documentId=chunk.documentId,
                 embeddingModelId=embedding_model_id or "",
-                vector=embedding,
+                textHash=key,
+                vector=cached[key],
             )
-            for chunk, embedding in zip(chunk_models, embeddings, strict=True)
+            for chunk, key in zip(chunk_models, hashes, strict=True)
         ]
     )
     write_knowledge_index(index)

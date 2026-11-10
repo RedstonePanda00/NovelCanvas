@@ -1,6 +1,6 @@
 /* eslint-disable */
 // Generated from FastAPI OpenAPI. Do not edit by hand.
-// Schema digest: 0362e2ffaa5b1a68
+// Schema digest: 92f40b821db91198
 
 export interface AIGenerationPlan {
   "id": string;
@@ -28,14 +28,6 @@ export interface AgentActivity {
   "planned"?: number;
 }
 
-export interface AgentEdit {
-  "title": string;
-  "body": string;
-  "targetNodeId": string;
-  "operation": "replace" | "create";
-  "nodeType": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "container";
-}
-
 export interface AgentMutation {
   "id": string;
   "kind": "edge" | "worldbook" | "node_delete" | "node_links";
@@ -60,35 +52,8 @@ export interface AgentRun {
   "error"?: string;
 }
 
-export interface AssistantContext {
-  "nodes": Array<ContextItem>;
-  "worldbook": Array<ContextItem>;
-  "relationships"?: Array<Record<string, string>>;
-}
-
-export interface AssistantRequest {
-  "project": ProjectFile;
-  "scope"?: "attached" | "project";
-  "checkpoint"?: Record<string, unknown> | null;
-  "targetNodeId": string;
-  "targetNodeIds"?: Array<string>;
-  "referenceNodeIds"?: Array<string>;
-  "includeWorldbook"?: boolean;
-  "excludedWorldbookIds"?: Array<string>;
-  "action"?: "discuss" | "revise" | "create" | "agent";
-  "message": string;
-  "preserve"?: string;
-  "baseText"?: string | null;
-  "outputType"?: "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "container";
-  "history"?: Array<HistoryMessage>;
-}
-
-export interface AssistantResponse {
-  "reply": string;
-  "blocks"?: Array<ChatBlock>;
-  "proposal"?: Proposal | null;
-  "context": AssistantContext;
-  "edits"?: Array<AgentEdit>;
+export interface Body_post_new_project_api_project_new_post {
+  "title": string;
 }
 
 export interface CanvasEdge {
@@ -102,7 +67,7 @@ export interface CanvasEdge {
 
 export interface CanvasNode {
   "id": string;
-  "type": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "container";
+  "type": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "image" | "container";
   "title": string;
   "body"?: string | null;
   "position": Point;
@@ -112,23 +77,13 @@ export interface CanvasNode {
   "targetWordCount"?: number | null;
   "narrativeTask"?: string | null;
   "childNodeIds"?: Array<string>;
+  "image"?: ImageAttachment | null;
+  "worldbookEntryIds"?: Array<string>;
 }
 
 export interface ChatBlock {
   "title": string;
   "body": string;
-}
-
-export interface ChatModelSelection {
-  "modelId"?: string | null;
-}
-
-export interface ContextItem {
-  "id": string;
-  "title": string;
-  "content": string;
-  "nodeType"?: "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "container" | null;
-  "relationships"?: Array<string>;
 }
 
 export interface ContextPreviewExcluded {
@@ -142,7 +97,7 @@ export interface ContextPreviewItem {
   "edgeId": string;
   "nodeId": string;
   "title": string;
-  "nodeType": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "container";
+  "nodeType": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "image" | "container";
   "semantic": "must_follow" | "instruction" | "reference" | "can_rewrite" | "style_reference" | "review_basis" | "review_target";
   "estimatedTokens": number;
 }
@@ -178,7 +133,7 @@ export interface DraftVersion {
   "feedback"?: string;
   "preserve"?: string;
   "rationale"?: string;
-  "nodeType": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "container";
+  "nodeType": "paragraph" | "outline" | "scene" | "character" | "supplemental_info" | "instruction" | "image" | "container";
   "operation"?: "replace" | "create";
   "status"?: "pending" | "accepted" | "rejected" | "rolled_back";
   "targetNodeId"?: string | null;
@@ -203,9 +158,9 @@ export interface HTTPValidationError {
   "detail"?: Array<ValidationError>;
 }
 
-export interface HistoryMessage {
-  "role": "user" | "assistant";
-  "content": string;
+export interface ImageAttachment {
+  "dataUrl": string;
+  "fileName": string;
 }
 
 export interface KnowledgeBaseMetadata {
@@ -308,11 +263,6 @@ export interface ProjectSettings {
   "modelGlobalPrompts"?: Record<string, Record<string, string>>;
 }
 
-export interface Proposal {
-  "title": string;
-  "body": string;
-}
-
 export interface ProviderIdRequest {
   "providerId": string;
 }
@@ -398,6 +348,7 @@ export interface RegisteredModel {
 export interface SceneStreamRequest {
   "project": ProjectFile;
   "sourceNodeIds": Array<string>;
+  "deltaPreview"?: boolean;
   "desiredCount": number;
 }
 

@@ -12,7 +12,7 @@ def read_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def atomic_write_json(path: Path, data: Any) -> None:
+def atomic_write_json(path: Path, data: Any, *, compact: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         "w",
@@ -22,7 +22,10 @@ def atomic_write_json(path: Path, data: Any) -> None:
         prefix=f".{path.name}.",
         suffix=".tmp",
     ) as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+        if compact:
+            handle.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+        else:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
         temp_name = handle.name
 

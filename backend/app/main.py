@@ -1,11 +1,13 @@
 import json
+from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
+from starlette.routing import Route
 
 from .ai_provider import ProviderRequestError, list_models, test_chat_completion, test_embedding
 from .models import (
@@ -50,20 +52,26 @@ from .stores import (
     initialize_storage,
     read_local_app_config,
     read_project,
+    create_project,
+    save_project_edits,
+    project_lock,
     storage_status,
     upsert_provider,
     upsert_registered_model,
-    write_project,
 )
 from .structure_plans import StructurePlanError, generate_structure_plan
-from .assistant_workbench import router as assistant_router
-from .assistant_stream import router as assistant_stream_router
+from .runtime_mcp import runtime
 from .scene_stream import router as scene_stream_router
 
 
-app = FastAPI(title="Novel Canvas API", version="0.2.0")
-app.include_router(assistant_router)
-app.include_router(assistant_stream_router)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    initialize_storage()
+    async with runtime.session_manager.run():
+        yield
+
+
+app = FastAPI(title="Novel Canvas API", version="0.2.0", lifespan=lifespan)
 app.include_router(scene_stream_router)
 
 app.add_middleware(
@@ -97,14 +105,9 @@ async def _ndjson_events(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
         )
 
 
-@app.on_event("startup")
-def startup() -> None:
-    initialize_storage()
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "service": "novelcanvas"}
 
 
 @app.get("/api/storage/status")
@@ -113,16 +116,28 @@ def get_storage_status() -> dict[str, str]:
 
 
 @app.get("/api/project")
-def get_project() -> ProjectFile:
-    return read_project()
+def get_project(x_project_revision: str | None = Header(default=None)) -> ProjectFile:
+    project = read_project()
+    if x_project_revision is not None and project.updatedAt == x_project_revision:
+        return Response(status_code=304)
+    return project
 
 
 @app.put("/api/project")
-def put_project(project: ProjectFile) -> ProjectFile:
+def put_project(project: ProjectFile, x_project_revision: str | None = Header(default=None)) -> ProjectFile:
     try:
-        return write_project(project)
+        with project_lock:
+            previous = read_project()
+            if x_project_revision is not None and x_project_revision != previous.updatedAt:
+                raise HTTPException(409, "Project changed elsewhere. Export your local draft before reloading.")
+            return save_project_edits(project, previous)
     except SecretValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/project/new")
+def post_new_project(title: str = Body(embed=True)) -> ProjectFile:
+    return create_project(title.strip() or "Untitled Novel Canvas Project")
 
 
 @app.get("/api/project/export")
@@ -301,3 +316,6 @@ def post_model_register(request: RegisterModelRequest) -> PublicLocalAppConfig:
     )
     config = upsert_registered_model(model)
     return to_public_local_app_config(config)
+
+
+app.router.routes.append(Route("/mcp", endpoint=runtime.streamable_http_app()))

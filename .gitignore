@@ -14,3 +14,12 @@ knowledge-base/
 
 # Runtime logs
 .logs/
+
+# Tool / test caches
+.test-tmp/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.pyc
+*.tsbuildinfo
+.DS_Store

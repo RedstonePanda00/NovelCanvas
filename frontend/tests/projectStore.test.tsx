@@ -3,8 +3,8 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEmptyProject } from '../src/project';
 
-const { saveProject } = vi.hoisted(() => ({ saveProject: vi.fn() }));
-vi.mock('../src/api', () => ({ api: { saveProject } }));
+const { saveProject, getProject } = vi.hoisted(() => ({ saveProject: vi.fn(), getProject: vi.fn() }));
+vi.mock('../src/api', () => ({ api: { saveProject, getProjectIfChanged: getProject } }));
 
 import { ProjectStoreProvider, useProjectStore } from '../src/projectStore';
 
@@ -32,6 +32,20 @@ describe('ProjectStoreProvider', () => {
     expect(saveProject).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText('undo'));
     expect(screen.getByTestId('title')).toHaveTextContent('Initial');
+  });
+
+  it('refreshes a clean canvas on focus and preserves a local edit on focus', async () => {
+    const external = { ...createEmptyProject('Agent edit'), updatedAt: 'external-revision' };
+    getProject.mockResolvedValue(external);
+    render(<ProjectStoreProvider><Harness /></ProjectStoreProvider>);
+    fireEvent.click(screen.getByText('open'));
+    await act(async () => { window.dispatchEvent(new Event('focus')); });
+    expect(screen.getByTestId('title')).toHaveTextContent('Agent edit');
+    fireEvent.click(screen.getByText('change'));
+    await act(async () => { window.dispatchEvent(new Event('focus')); });
+    expect(screen.getByTestId('title')).toHaveTextContent('Changed');
+    await act(async () => { await vi.advanceTimersByTimeAsync(900); });
+    expect(saveProject.mock.calls[0][1]).toBe('external-revision');
   });
 
   it('keeps an error state when persistence fails', async () => {

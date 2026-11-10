@@ -18,6 +18,7 @@ router = APIRouter(prefix="/api/plans")
 class SceneStreamRequest(BaseModel):
     project: ProjectFile
     sourceNodeIds: list[str] = Field(min_length=1, max_length=100)
+    deltaPreview: bool = False
     desiredCount: int = Field(ge=1, le=12)
 
 
@@ -41,20 +42,37 @@ def stream_scenes(request: SceneStreamRequest) -> StreamingResponse:
 
     async def events():
         raw = ""
-        previous = None
+        previous = []
+        next_preview = 0
         try:
             async for chunk in stream_chat_completion(routed.provider, routed.registered.modelId, messages, max_tokens=max_tokens, json_response=True):
                 raw += chunk
                 if len(raw) > 500000:
                     raise ValueError("Scene output exceeded the preview limit.")
+                # Geometric checkpoints bound cumulative parsing even for token-sized chunks.
+                if len(raw) < next_preview:
+                    continue
                 partial = partial_json(raw)
                 nodes = partial.get("nodes") if isinstance(partial, dict) else None
                 if isinstance(nodes, list):
                     previews = [{key: item.get(key) if isinstance(item, dict) and isinstance(item.get(key), str) else "" for key in ("title", "body")} for item in nodes[:request.desiredCount]]
-                    line = event_line({"type": "preview", "nodes": previews})
-                    if line != previous:
-                        yield line
-                        previous = line
+                    if previews != previous:
+                        if request.deltaPreview:
+                            changes = []
+                            for index, scene in enumerate(previews):
+                                old = previous[index] if index < len(previous) else {}
+                                for field, text in scene.items():
+                                    prefix = old.get(field, "")
+                                    if text != prefix:
+                                        offset = len(prefix.encode("utf-16-le")) // 2 if text.startswith(prefix) else 0
+                                        suffix = text[len(prefix):] if offset else text
+                                        changes.append({"index": index, "field": field, "offset": offset, "text": suffix})
+                            if changes:
+                                yield event_line({"type": "delta", "changes": changes})
+                        else:
+                            yield event_line({"type": "preview", "nodes": previews})
+                        previous = previews
+                next_preview = len(raw) + max(32, len(raw) // 16)
             payload = json.loads(raw)
             nodes = payload.get("nodes") if isinstance(payload, dict) else None
             if not isinstance(nodes, list) or len(nodes) != request.desiredCount:

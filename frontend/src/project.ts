@@ -12,7 +12,7 @@ import type {
 } from './types';
 
 export const nodeTypes: NodeType[] = [
-  'paragraph', 'outline', 'scene', 'character', 'supplemental_info', 'instruction', 'container',
+  'paragraph', 'outline', 'scene', 'character', 'supplemental_info', 'instruction', 'image', 'container',
 ];
 
 export const edgeSemantics: EdgeSemantic[] = [
@@ -33,7 +33,7 @@ export function createMetadata(tags: string[] = []): NodeMetadata {
 }
 
 export function createNode(type: NodeType, index: number, position: Point): CanvasNode {
-  const size = type === 'container' ? { width: 420, height: 260 } : { width: 340, height: 250 };
+  const size = type === 'container' ? { width: 420, height: 260 } : type === 'image' ? { width: 340, height: 420 } : { width: 340, height: 250 };
   return {
     id: `node-${crypto.randomUUID()}`,
     type,
@@ -131,6 +131,7 @@ export function defaultSemantic(source: CanvasNode | undefined, _target: CanvasN
 }
 
 export function validWorkflow(node: CanvasNode, workflow: StructureWorkflow): boolean {
+  if (node.type === 'image') return false;
   if (workflow === 'generate-outline') return node.type !== 'paragraph';
   if (workflow === 'generate-scenes') return node.type === 'outline';
   if (workflow === 'generate-next-scene' || workflow === 'split-scene' || workflow === 'generate-paragraph-tasks') return node.type === 'scene';

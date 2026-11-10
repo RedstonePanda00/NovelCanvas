@@ -8,12 +8,9 @@ import type {
   RagPreviewResponse,
   RegisteredModel,
   StructureWorkflow,
-  AssistantRequest, AssistantResponse, AssistantContext,
-  ChatBlock,
-  AgentActivity,
 } from './types';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:53173';
 
 export class ApiError extends Error {
   constructor(
@@ -131,7 +128,6 @@ export async function streamText(
   if (!completed) throw new ApiError('The generation stream ended unexpectedly.', 'incomplete_stream');
 }
 
-export interface AssistantPreview { reply: string; blocks: ChatBlock[]; edits: ChatBlock[] }
 export interface SceneDraft { title: string; body: string }
 
 export async function streamEvents<T extends { type: string }>(path: string, body: unknown, onEvent: (event: T) => void, signal?: AbortSignal): Promise<void> {
@@ -163,34 +159,36 @@ export async function streamEvents<T extends { type: string }>(path: string, bod
 }
 
 export const api = {
-  async streamAssistant(input: AssistantRequest, onPreview: (preview: AssistantPreview) => void, signal?: AbortSignal,
-    onAgentEvent?: (event: { type: 'activity'; activity: AgentActivity } | { type: 'checkpoint'; checkpoint: Record<string, unknown> }) => void): Promise<AssistantResponse> {
-    let result: AssistantResponse | undefined;
-    await streamEvents<({ type: 'preview' } & AssistantPreview) | { type: 'done'; response: AssistantResponse } | ({ type: 'activity' } & AgentActivity) | { type: 'checkpoint'; checkpoint: Record<string, unknown> }>('/api/assistant/stream', input, (event) => {
-      if (event.type === 'preview') onPreview(event);
-      if (event.type === 'done') result = event.response;
-      if (event.type === 'activity') onAgentEvent?.({ type: 'activity', activity: event });
-      if (event.type === 'checkpoint') onAgentEvent?.(event);
-    }, signal);
-    if (!result) throw new ApiError('Missing completed response.', 'incomplete_stream');
-    return result;
-  },
   async streamScenes(project: ProjectFile, sourceNodeIds: string[], desiredCount: number, onPreview: (nodes: SceneDraft[]) => void, signal?: AbortSignal): Promise<SceneDraft[]> {
     let result: SceneDraft[] | undefined;
-    await streamEvents<{ type: 'preview' | 'done'; nodes: SceneDraft[] }>('/api/plans/scenes/stream', { project, sourceNodeIds, desiredCount }, (event) => {
+    type Delta = { index: number; field: keyof SceneDraft; offset: number; text: string };
+    const drafts: SceneDraft[] = [];
+    await streamEvents<{ type: 'preview' | 'done'; nodes: SceneDraft[] } | { type: 'delta'; changes: Delta[] }>(
+      '/api/plans/scenes/stream', { project, sourceNodeIds, desiredCount, deltaPreview: true }, (event) => {
+      if (event.type === 'delta') {
+        for (const change of event.changes) {
+          const draft = drafts[change.index] ?? { title: '', body: '' };
+          drafts[change.index] = { ...draft, [change.field]: draft[change.field].slice(0, change.offset) + change.text };
+        }
+        onPreview(drafts.slice());
+      }
       if (event.type === 'preview') onPreview(event.nodes);
       if (event.type === 'done') result = event.nodes;
     }, signal);
     if (!result || result.length !== desiredCount) throw new ApiError('Scene count does not match reserved slots.', 'invalid_stream');
     return result;
   },
-  setChatModel: (modelId: string | null) => request<PublicLocalAppConfig>('/api/assistant/model', { method: 'PUT', body: JSON.stringify({ modelId }) }),
-  assistantContext: (input: AssistantRequest, signal?: AbortSignal) => request<AssistantContext>('/api/assistant/context', { method: 'POST', body: JSON.stringify(input), signal }),
-  runAssistant: (input: AssistantRequest, signal?: AbortSignal) => request<AssistantResponse>('/api/assistant/run', { method: 'POST', body: JSON.stringify(input), signal }),
+  async getProjectIfChanged(revision: string): Promise<ProjectFile | null> {
+    const response = await fetch(`${API_BASE}/api/project`, { headers: { 'X-Project-Revision': revision } });
+    if (response.status === 304) return null;
+    if (!response.ok) throw await responseError(response);
+    return response.json();
+  },
   getProject: () => request<ProjectFile>('/api/project'),
-  saveProject: (project: ProjectFile) => request<ProjectFile>('/api/project', { method: 'PUT', body: JSON.stringify(project) }),
+  saveProject: (project: ProjectFile, revision?: string) => request<ProjectFile>('/api/project', { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(revision === undefined ? {} : { 'X-Project-Revision': revision }) }, body: JSON.stringify(project) }),
   exportProject: () => request<ProjectFile>('/api/project/export'),
   importProject: (project: unknown) => request<ProjectFile>('/api/project/import', { method: 'POST', body: JSON.stringify(project) }),
+  newProject: (title: string) => request<ProjectFile>('/api/project/new', { method: 'POST', body: JSON.stringify({ title }) }),
   getAppConfig: () => request<PublicLocalAppConfig>('/api/app-config'),
   registerProvider: (input: ProviderRegistrationInput) =>
     request<PublicLocalAppConfig>('/api/providers/register', { method: 'POST', body: JSON.stringify(input) }),

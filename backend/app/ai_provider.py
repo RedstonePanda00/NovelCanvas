@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -69,6 +70,34 @@ async def create_chat_completion(
     max_tokens: int = 2000,
     json_response: bool = True,
 ) -> str:
+    host = (urlsplit(provider.baseUrl).hostname or "").lower()
+    normalized_model = model_id.lower().removeprefix("pro/")
+    is_siliconflow_kimi = (
+        host in {"api.siliconflow.cn", "api.siliconflow.com"}
+        and normalized_model.startswith("moonshotai/kimi-k2.7")
+    )
+    if is_siliconflow_kimi:
+        try:
+            chunks = [
+                chunk
+                async for chunk in stream_chat_completion(
+                    provider,
+                    model_id,
+                    messages,
+                    max_tokens=max_tokens,
+                    json_response=json_response,
+                    temperature=0.4,
+                    read_timeout=120.0,
+                    require_complete=True,
+                )
+            ]
+        except httpx.TimeoutException as exc:
+            raise ProviderRequestError("Chat completion timed out while waiting for provider activity.") from exc
+        content = "".join(chunks)
+        if not content.strip():
+            raise ProviderRequestError("Chat completion failed: provider returned no final content.")
+        return content
+
     payload = {
         "model": model_id,
         "messages": messages,
@@ -115,18 +144,23 @@ async def stream_chat_completion(
     messages: list[dict[str, str]],
     max_tokens: int = 2000,
     json_response: bool = False,
+    temperature: float = 0.7,
+    read_timeout: float | None = None,
+    require_complete: bool = False,
 ) -> AsyncIterator[str]:
     payload = {
         "model": model_id,
         "messages": messages,
         "max_tokens": max_tokens,
         "stream": True,
-        "temperature": 0.7,
+        "temperature": temperature,
     }
     if json_response:
         payload["response_format"] = {"type": "json_object"}
 
-    async with httpx.AsyncClient(timeout=None) as client:
+    timeout = httpx.Timeout(read_timeout, connect=30.0) if read_timeout is not None else None
+    completed = False
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
             _provider_url(provider, "chat/completions"),
@@ -144,13 +178,19 @@ async def stream_chat_completion(
                     continue
 
                 data = line.removeprefix("data:").strip()
-                if not data or data == "[DONE]":
+                if data == "[DONE]":
+                    completed = True
+                    break
+                if not data:
                     continue
 
                 try:
                     payload = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+
+                if isinstance(payload, dict) and payload.get("error"):
+                    raise ProviderRequestError("Chat completion failed: provider returned a stream error.")
 
                 choices = payload.get("choices")
                 if not isinstance(choices, list) or not choices:
@@ -159,6 +199,12 @@ async def stream_chat_completion(
                 choice = choices[0]
                 if not isinstance(choice, dict):
                     continue
+
+                finish_reason = choice.get("finish_reason")
+                if require_complete and finish_reason == "length":
+                    raise ProviderRequestError("Chat completion failed: provider truncated the response.")
+                if finish_reason == "stop":
+                    completed = True
 
                 delta = choice.get("delta")
                 if isinstance(delta, dict):
@@ -172,6 +218,9 @@ async def stream_chat_completion(
                     content = message.get("content")
                     if isinstance(content, str):
                         yield content
+
+    if require_complete and not completed:
+        raise ProviderRequestError("Chat completion failed: provider stream ended before completion.")
 
 
 async def test_embedding(provider: AIProviderConfig, model_id: str) -> int | None:

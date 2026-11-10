@@ -1,8 +1,5 @@
-import { expect, test, type Page, type Route } from '@playwright/test';
-
-function assistantResult(route: Route, result: unknown) {
-  return route.fulfill({ contentType: 'application/x-ndjson', body: JSON.stringify({ type: 'done', response: result }) + '\n' });
-}
+import { expect, test, type Page } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
 
 function projectFixture(count = 200) {
   const timestamp = '2026-01-01T00:00:00.000Z';
@@ -36,8 +33,7 @@ function projectFixture(count = 200) {
 
 async function mockApi(page: Page, count = 200) {
   let project = projectFixture(count);
-  let revision = 0;
-  await page.route('http://127.0.0.1:8000/api/**', async (route) => {
+  await page.route('http://127.0.0.1:53173/api/**', async (route) => {
     const url = new URL(route.request().url());
     const path = url.pathname;
     if (path === '/api/project' && route.request().method() === 'GET') return route.fulfill({ json: project });
@@ -47,18 +43,6 @@ async function mockApi(page: Page, count = 200) {
     }
     if (path === '/api/app-config') return route.fulfill({ json: { providers: [], registeredModels: [] } });
     if (path === '/api/memory') return route.fulfill({ json: { id: 'project-memory', title: 'Memory', documents: [], embeddingModelId: null, sourceFingerprint: '', stale: true, updatedAt: '' } });
-    if (path === '/api/assistant/context' || path === '/api/assistant/stream') {
-      const input = route.request().postDataJSON();
-      const targets = input.targetNodeIds ?? [input.targetNodeId];
-      const automatic = project.edges.filter((edge) => targets.includes(edge.targetNodeId)).map((edge) => edge.sourceNodeId);
-      const ids = [...targets, ...automatic, ...input.referenceNodeIds];
-      const context = { nodes: project.nodes.filter((node) => ids.includes(node.id)).map((node) => ({ id: node.id, title: node.title, content: node.body })), worldbook: [] };
-      if (path.endsWith('/context')) return route.fulfill({ json: context });
-      revision += 1;
-      const create = input.message.startsWith('Create');
-      const edits = input.message.startsWith('Discuss') ? [] : [{ targetNodeId: input.targetNodeId, operation: create ? 'create' : 'replace', nodeType: create ? 'character' : project.nodes.find((node) => node.id === input.targetNodeId)!.type, title: create ? 'Designed character' : 'Revised scene', body: `Candidate body ${revision}` }];
-      return assistantResult(route, { reply: `Design rationale ${revision}`, edits, context });
-    }
     return route.fulfill({ status: 404, json: { detail: `Unmocked ${path}` } });
   });
 }
@@ -67,6 +51,86 @@ test.beforeEach(async ({ page }) => {
   await mockApi(page);
   await page.goto('/');
   await page.locator('.canvas-stage').waitFor();
+});
+
+test('uploads an illustration, saves it and includes it in worldbook export', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop');
+  await mockApi(page, 0);
+  await page.reload();
+  await page.locator('.node-palette button').filter({ hasText: /^image$/i }).click();
+  await page.locator('.canvas-stage').click({ position: { x: 120, y: 80 } });
+  const card = page.locator('.canvas-node.type-border-image');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
+  await card.getByLabel('Upload image', { exact: true }).setInputFiles({ name: 'castle.png', mimeType: 'image/png', buffer: png });
+  await expect(card.locator('img')).toBeVisible();
+  await card.locator('textarea').fill('A castle in the snow');
+  await expect(page.locator('.save-indicator')).toContainText('Saved');
+  await page.reload();
+  await expect(card.locator('img')).toHaveAttribute('alt', 'A castle in the snow');
+  await expect.poll(() => card.locator('img').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(1);
+  await page.screenshot({ path: testInfo.outputPath('image-node.png') });
+  await page.locator('.primary-nav').getByRole('button', { name: /Worldbook/ }).click();
+  await page.getByRole('button', { name: 'Add entry', exact: true }).click();
+  await page.locator('.accordion-card summary').click();
+  await page.getByLabel('Link image node').selectOption({ index: 1 });
+  await expect(page.locator('.illustration-grid img')).toBeVisible();
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export Worldbook', exact: true }).click();
+  const download = await downloadPromise;
+  const data = JSON.parse(await readFile((await download.path())!, 'utf8'));
+  expect(data.imageNodes[0].image.fileName).toBe('castle.png');
+  expect(data.imageNodes[0].worldbookEntryIds).toEqual([data.entries[0].id]);
+  await page.locator('.illustration-grid').getByRole('button', { name: 'Unlink', exact: true }).click();
+  await expect(page.locator('.illustration-grid img')).toHaveCount(0);
+  page.on('dialog', dialog => dialog.accept());
+  await page.locator('.page-content input[type=file][accept=".json,application/json"]').setInputFiles({ name: 'worldbook.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(data)) });
+  await expect(page.locator('.illustration-grid img')).toBeVisible();
+});
+
+test('new project opens with remembered model roles and respects reduced motion', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop');
+  const fixture = projectFixture(0);
+  const writer = { id: 'writer', displayName: 'Writer', enabled: true, capabilityTags: ['text'] };
+  await page.route('**/api/app-config', route => route.fulfill({ json: { providers: [], registeredModels: [writer] } }));
+  await page.route('**/api/project/new', route => route.fulfill({ json: {
+    ...fixture, title: route.request().postDataJSON().title,
+    settings: { ...fixture.settings, modelRouting: { paragraphGenerationModelId: 'writer' } },
+  } }));
+  page.on('dialog', dialog => dialog.accept(dialog.type() === 'prompt' ? 'Second book' : undefined));
+  await page.locator('.project-menu summary').click();
+  await page.getByRole('button', { name: 'New project', exact: true }).click();
+  await expect(page.locator('.brand-copy')).toContainText('Second book');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  await expect(page.getByLabel('Paragraph', { exact: true })).toHaveValue('writer');
+  await expect(page.locator('.page-heading')).toHaveCSS('animation-name', 'panelEnter');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(page.locator('.page-heading')).toHaveCSS('animation-name', 'none');
+});
+
+test('keeps the canvas, selection and local undo across an external text edit', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop');
+  const fixture = projectFixture(5);
+  await page.route('**/api/project', async route => {
+    if (route.request().method() === 'PUT') Object.assign(fixture, route.request().postDataJSON());
+    await route.fulfill({ json: fixture });
+  });
+  await page.reload();
+  const card = page.locator('[data-node-id="node-1"]');
+  await page.locator('.navigator-list button').nth(1).click();
+  const saved = page.waitForResponse(r => r.url().endsWith('/api/project') && r.request().method() === 'PUT');
+  await card.locator('textarea').fill('Local draft');
+  await saved;
+  const original = await card.elementHandle();
+  fixture.nodes[0].title = 'Changed by MCP';
+  fixture.updatedAt = 'remote-revision';
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await expect(page.locator('[data-node-id="node-0"] input').first()).toHaveValue('Changed by MCP');
+  expect(await original!.evaluate(el => el.isConnected)).toBe(true);
+  await expect(card).toHaveClass(/selected/);
+  await page.locator('.canvas-commandbar .icon-button').first().click();
+  await expect(card.locator('textarea')).toHaveValue('Content for node 1');
+  await expect(page.locator('[data-node-id="node-0"] input').first()).toHaveValue('Changed by MCP');
 });
 
 test('loads, fits and edits a 200-node project', async ({ page }) => {
@@ -155,57 +219,6 @@ test('keeps mobile navigation and scrolling accessible', async ({ page }, testIn
   await expect(page.getByRole('heading', { name: 'Settings' }).first()).toBeVisible();
 });
 
-async function openChat(page: Page) {
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  const panel = page.getByRole('region', { name: 'Writing chat' });
-  await panel.getByRole('button', { name: '+ Attach selected node', exact: true }).click();
-  return panel;
-}
-
-test('discusses, directly edits, iterates and rolls back after reload', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Discuss a motive and explain why.');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('log')).toContainText('Design rationale 1');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Make the dialogue shorter. Keep the ending.');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Candidate body 2');
-  await panel.getByRole('button', { name: 'Continue revising', exact: true }).click();
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Keep the dialogue but improve the ending.');
-  const sent = page.waitForRequest((request) => request.url().endsWith('/api/assistant/stream'));
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  expect((await sent).postDataJSON().message).toContain('Candidate body 2');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Candidate body 3');
-  await expect(page.locator('.save-indicator')).toContainText('Saved');
-  await page.reload();
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  await expect(panel.locator('.chat-change')).toHaveCount(1);
-  await panel.getByRole('button', { name: 'Compare', exact: true }).last().click();
-  const dialog = page.getByRole('dialog', { name: 'Version comparison' });
-  await expect(dialog).toContainText('Candidate body 2');
-  await expect(dialog).toContainText('Candidate body 3');
-  await dialog.getByRole('button', { name: 'Roll back', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Candidate body 2');
-  await dialog.getByRole('button', { name: 'Close comparison' }).click();
-  await expect(panel.getByRole('button', { name: 'Roll back', exact: true })).toHaveCount(0);
-  await page.screenshot({ path: 'test-results/workbench-pc.png', fullPage: true });
-});
-
-test('creates a clean character and rolls back its creation', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Create a character name and personality.');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.locator('.canvas-node')).toHaveCount(201);
-  const created = page.locator('.canvas-node').last();
-  await expect(created.locator('textarea')).toHaveValue('Candidate body 1');
-  await expect(created.locator('input').first()).toHaveValue('Designed character');
-  await panel.getByRole('button', { name: 'Roll back', exact: true }).click();
-  await expect(page.locator('.canvas-node')).toHaveCount(200);
-});
-
 test('searches a source and adds a directed relationship without duplicates', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop');
   const picker = page.getByRole('region', { name: 'Add relationship', exact: true });
@@ -241,245 +254,6 @@ test('drags a connection onto the whole target node and confirms its meaning', a
   await expect(page.locator('.connection-preview')).toHaveCount(0);
 });
 
-test('failed discussion keeps feedback and leaves manuscript unchanged', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await page.route('**/api/assistant/stream', (route) => route.fulfill({ status: 400, json: { detail: 'Select a chat model in Settings.' } }));
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Keep this feedback after failure');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('alert')).toContainText('Select a chat model');
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toHaveValue('Keep this feedback after failure');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-});
-
-test('uses a linked review as editable feedback without automatically applying it', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  const project = projectFixture(2);
-  project.nodes[1].type = 'review'; project.nodes[1].body = 'Shorten the opening. Keep the ending.';
-  project.edges[0].semantic = 'review_target';
-  await page.route('**/api/project', (route) => route.fulfill({ json: project }));
-  await page.reload();
-  const panel = await openChat(page);
-  await panel.getByText('Use review feedback', { exact: true }).click();
-  await panel.getByRole('button', { name: 'Use as editable feedback' }).click();
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toHaveValue(project.nodes[1].body);
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-});
-
-test('drops a target into collapsed chat, expands access, and keeps drafts when selection changes', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  const panel = page.getByRole('region', { name: 'Writing chat' });
-  await page.locator('.navigator-list button').nth(2).dragTo(panel);
-  await expect(panel.getByLabel('Chat targets')).toContainText('Node 2');
-  await panel.getByLabel('Scope', { exact: true }).selectOption('attached');
-  await panel.locator('.assistant-context > summary').click();
-  await expect(panel.getByText('↳ Node 1', { exact: true })).toBeVisible();
-  await panel.getByRole('button', { name: 'Allow reading: Node 0', exact: true }).click();
-  await expect(panel.getByText('↳ Node 0', { exact: true })).toBeVisible();
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Unsent design idea');
-  await panel.getByRole('button', { name: 'Collapse chat', exact: true }).click();
-  await page.locator('.navigator-list button').nth(3).click();
-  await panel.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toHaveValue('Unsent design idea');
-  await expect(panel.getByLabel('Chat targets')).toContainText('Node 2');
-  await expect(panel.getByLabel('Chat targets')).not.toContainText('Node 3');
-});
-
-test('keeps a concurrent manual edit and records the agent result as a conflict', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await page.locator('.navigator-list button').first().click();
-  await page.getByRole('button', { name: 'Fit selection', exact: true }).click();
-  let release!: () => void;
-  const hold = new Promise<void>((resolve) => { release = resolve; });
-  await page.route('**/api/assistant/stream', async (route) => {
-    await hold;
-    await assistantResult(route, { reply: 'Updated', edits: [{ targetNodeId: 'node-0', operation: 'replace', nodeType: 'paragraph', title: 'Change', body: 'Agent replacement' }], context: { nodes: [], worldbook: [] } });
-  });
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Change the opening');
-  const sent = page.waitForRequest('**/api/assistant/stream');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await sent;
-  const body = page.locator('[data-node-id="node-0"] textarea');
-  await body.fill('My newer manual edit');
-  release();
-  await expect(panel.locator('.chat-change')).toContainText('Text changed');
-  await expect(body).toHaveValue('My newer manual edit');
-  await panel.getByRole('button', { name: 'Accept candidate', exact: true }).click();
-  await expect(body).toHaveValue('My newer manual edit');
-});
-
-test('attaches multiple targets and sends without writing during general discussion', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  const panel = page.getByRole('region', { name: 'Writing chat' });
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Discuss a theme');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('log')).toContainText('Design rationale 1');
-  await page.locator('.navigator-list button').nth(1).dragTo(panel.locator('.chat-targets'));
-  await page.locator('.navigator-list button').nth(2).dragTo(panel.locator('.chat-targets'));
-  await expect(panel.locator('.chat-target')).toHaveCount(2);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Discuss these scenes');
-  const sent = page.waitForRequest('**/api/assistant/stream');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  expect((await sent).postDataJSON().targetNodeIds).toEqual(['node-1', 'node-2']);
-  await expect(panel.getByRole('log')).toContainText('Design rationale 2');
-  await expect(panel.locator('.chat-change')).toHaveCount(0);
-  const composer = await panel.locator('.chat-composer').boundingBox();
-  expect(composer!.y + composer!.height).toBeLessThanOrEqual(1000);
-});
-
-test('keeps the original inspector visible beside chat and restores separate conversations', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  const panel = await openChat(page);
-  const inspector = page.locator('.inspector-panel');
-  await expect(inspector.getByRole('region', { name: 'Add relationship', exact: true })).toBeVisible();
-  const inspectorBox = await inspector.boundingBox();
-  const chatBox = await page.locator('.chat-sidebar').boundingBox();
-  expect(chatBox!.x).toBeGreaterThanOrEqual(inspectorBox!.x + inspectorBox!.width - 1);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Discuss the first scene');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('log')).toContainText('Design rationale 1');
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('First unfinished idea');
-  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
-  const current = page.getByRole('region', { name: 'Writing chat' });
-  await expect(current.locator('.chat-target')).toHaveCount(0);
-  await expect(current.getByLabel('Request / feedback', { exact: true })).toHaveValue('');
-  await expect(current.getByRole('log')).not.toContainText('Design rationale 1');
-  await current.getByLabel('Request / feedback', { exact: true }).fill('Second unfinished idea');
-  await page.locator('[data-conversation-id="__chat__"]').click();
-  await expect(current.getByLabel('Request / feedback', { exact: true })).toHaveValue('First unfinished idea');
-  await expect(current.locator('.chat-target')).toHaveCount(1);
-  await expect(page.locator('.save-indicator')).toContainText('Saved');
-  await page.reload();
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  await expect(current.getByLabel('Request / feedback', { exact: true })).toHaveValue('First unfinished idea');
-  await page.locator('[data-conversation-id^="__chat__:"]').click();
-  await expect(current.getByLabel('Request / feedback', { exact: true })).toHaveValue('Second unfinished idea');
-  await page.getByRole('button', { name: 'Fit selection', exact: true }).click();
-  await page.screenshot({ path: 'test-results/chat-layout.png', fullPage: true });
-  await current.getByRole('button', { name: 'Collapse chat', exact: true }).click();
-  await expect(inspector).toBeVisible();
-  await expect(page.getByRole('navigation', { name: 'Conversations', exact: true })).toBeVisible();
-  await page.getByRole('navigation', { name: 'Conversations', exact: true }).getByRole('button', { name: 'Collapse conversations', exact: true }).click();
-  expect((await page.locator('.chat-sidebar').boundingBox())!.width).toBeLessThan(50);
-});
-
-test('Cursor-style chat keeps navigation independent and moves the new-chat composer after sending', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  const panel = page.getByRole('region', { name: 'Writing chat' });
-  const list = page.getByRole('navigation', { name: 'Conversations', exact: true });
-  const composer = panel.locator('.chat-composer');
-  await expect(panel.getByLabel('Mode', { exact: true }).locator('option')).toHaveCount(1);
-  await expect(panel.getByLabel('Mode', { exact: true })).toHaveValue('agent');
-  expect(await page.locator('.chat-sidebar').evaluate((element) => getComputedStyle(element).getPropertyValue('--surface-1').trim())).toBe(await page.locator('.inspector-panel').evaluate((element) => getComputedStyle(element).getPropertyValue('--surface-1').trim()));
-  const originalTop = (await composer.boundingBox())!.y;
-  const panelTop = (await panel.boundingBox())!.y;
-  expect(originalTop - panelTop).toBeLessThan(80);
-  await expect(list).toBeVisible();
-  await page.screenshot({ path: 'test-results/cursor-chat-empty.png', fullPage: true });
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Discuss the ending');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('log')).toContainText('Design rationale');
-  expect((await composer.boundingBox())!.y).toBeGreaterThan(originalTop + 300);
-  await list.getByRole('button', { name: 'New conversation', exact: true }).click();
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('A separate unfinished idea');
-  await list.getByLabel('Search conversations').fill('ending');
-  await expect(list.locator('.chat-conversation-item')).toHaveCount(1);
-  await list.locator('.chat-conversation-item').click();
-  await expect(panel.getByRole('log')).toContainText('Design rationale');
-  await list.getByLabel('Search conversations').fill('absent title');
-  await expect(list).toContainText('No matching conversations');
-  await list.getByLabel('Search conversations').fill('');
-  await list.getByRole('button', { name: 'Collapse conversations', exact: true }).click();
-  await expect(list).toBeHidden();
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toBeVisible();
-  await panel.getByRole('button', { name: 'Expand conversations', exact: true }).click();
-  await panel.getByRole('button', { name: 'Collapse chat', exact: true }).click();
-  await expect(list).toBeVisible();
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toBeHidden();
-  await list.locator('[data-conversation-id^="__chat__:"]').click();
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toHaveValue('A separate unfinished idea');
-  await expect(page.locator('.inspector-panel')).toBeVisible();
-});
-
-test('renders report blocks, copies the whole report and retains it for follow-up after reload', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await page.addInitScript(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (text: string) => { (window as unknown as { copiedReport: string }).copiedReport = text; } } }));
-  await page.route('**/api/assistant/stream', (route) => assistantResult(route, { reply: 'Here is the report.', blocks: [{ title: 'Continuity report', body: 'Finding: the promise is unresolved.\nSuggestion: clarify the choice.' }], edits: [], context: { nodes: [], worldbook: [] } }));
-  await page.reload();
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Review this scene and give me a report');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  const report = panel.getByRole('region', { name: 'Continuity report' });
-  await expect(report.locator('pre')).toContainText('promise is unresolved');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-  await report.locator('summary').click();
-  await expect(report.locator('pre')).toBeHidden();
-  await report.getByRole('button', { name: 'Copy full text', exact: true }).click();
-  expect(await page.evaluate(() => (window as unknown as { copiedReport: string }).copiedReport)).toBe('Continuity report\n\nFinding: the promise is unresolved.\nSuggestion: clarify the choice.');
-  await expect(page.locator('.save-indicator')).toContainText('Saved');
-  await page.reload();
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  await expect(report.locator('pre')).toContainText('promise is unresolved');
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Explain the first finding');
-  const sent = page.waitForRequest('**/api/assistant/stream');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  expect((await sent).postDataJSON().history[1].content).toContain('Finding: the promise is unresolved.');
-  await expect(panel.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
-  await expect(panel.locator('.chat-block')).toHaveCount(1);
-  await page.screenshot({ path: 'test-results/report-block.png', fullPage: true });
-});
-
-test('deletes conversations and their change history without undoing manuscript edits', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Change this scene');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Candidate body 1');
-  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Keep this conversation');
-  await page.locator('[data-conversation-id="__chat__"]').click();
-  await page.getByRole('button', { name: 'Delete conversation', exact: true }).click();
-  let dialog = page.getByRole('dialog', { name: 'Delete conversation' });
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
-  await expect(page.locator('.chat-conversation-item')).toHaveCount(2);
-  await page.getByRole('button', { name: 'Delete conversation', exact: true }).click();
-  dialog = page.getByRole('dialog', { name: 'Delete conversation' });
-  await dialog.getByRole('button', { name: 'Confirm delete', exact: true }).click();
-  await expect(page.locator('.chat-conversation-item')).toHaveCount(1);
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toHaveValue('Keep this conversation');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Candidate body 1');
-  await expect(panel.locator('.chat-change')).toHaveCount(0);
-  await expect(page.locator('.save-indicator')).toContainText('Saved');
-  await page.reload();
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  await expect(page.locator('.chat-conversation-item')).toHaveCount(1);
-});
-
-test('deleting the last conversation cancels its request and does not resurrect it', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  let release!: () => void;
-  const hold = new Promise<void>((resolve) => { release = resolve; });
-  await page.route('**/api/assistant/stream', async (route) => {
-    await hold;
-    await assistantResult(route, { reply: 'Late response', edits: [{ targetNodeId: 'node-0', operation: 'replace', nodeType: 'paragraph', title: 'Late change', body: 'Late text' }], context: { nodes: [], worldbook: [] } }).catch(() => undefined);
-  });
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Change this scene');
-  const sent = page.waitForRequest('**/api/assistant/stream');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click(); await sent;
-  await page.getByRole('button', { name: 'Delete conversation', exact: true }).click();
-  await page.getByRole('dialog', { name: 'Delete conversation' }).getByRole('button', { name: 'Confirm delete', exact: true }).click();
-  release();
-  await expect(panel.getByLabel('Request / feedback', { exact: true })).toHaveValue('');
-  await expect(page.locator('.save-indicator')).toContainText('Saved');
-  await expect(panel.getByRole('log')).not.toContainText('Late response');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-  await expect(page.getByRole('button', { name: 'Delete conversation', exact: true })).toBeDisabled();
-});
-
 async function installControlledStream(page: Page, endpoint: string) {
   await page.addInitScript((path) => {
     const original = window.fetch.bind(window);
@@ -502,22 +276,6 @@ async function pushEvent(page: Page, event: unknown, close = false) {
   }, { event, close });
 }
 
-test('chat displays streamed text before completion and commits only the validated result', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await installControlledStream(page, '/api/assistant/stream'); await page.reload();
-  const panel = await openChat(page);
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Change the scene');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
-  await pushEvent(page, { type: 'preview', reply: 'First streamed words', blocks: [], edits: [{ title: 'Scene', body: 'Half a revision' }] });
-  await expect(panel.locator('.streaming')).toContainText('First streamed words');
-  await expect(panel.locator('.streaming')).toContainText('Half a revision');
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-  await pushEvent(page, { type: 'done', response: { reply: 'Complete response', edits: [{ targetNodeId: 'node-0', operation: 'replace', nodeType: 'paragraph', title: 'Scene', body: 'Finished revision' }], context: { nodes: [], worldbook: [] } } }, true);
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Finished revision');
-  await expect(panel.locator('.streaming')).toHaveCount(0);
-});
-
 test('outline reserves the requested scene nodes before streaming and fills the same slots', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop');
   const project = projectFixture(1); project.nodes[0].type = 'outline';
@@ -528,7 +286,11 @@ test('outline reserves the requested scene nodes before streaming and fills the 
   await expect(page.locator('.canvas-node.pending')).toHaveCount(3);
   const ids = await page.locator('.canvas-node.pending').evaluateAll((nodes) => nodes.map((node) => (node as HTMLElement).dataset.nodeId));
   await expect(page.locator('.plan-review-bar').getByRole('button', { name: 'Accept', exact: true })).toBeDisabled();
-  await pushEvent(page, { type: 'preview', nodes: [{ title: 'First scene', body: 'Opening conflict' }] });
+  await pushEvent(page, { type: 'delta', changes: [
+    { index: 0, field: 'title', offset: 0, text: 'First scene' },
+    { index: 0, field: 'body', offset: 0, text: 'Opening ' },
+  ] });
+  await pushEvent(page, { type: 'delta', changes: [{ index: 0, field: 'body', offset: 8, text: 'conflict' }] });
   await expect(page.locator('.canvas-node.pending textarea').first()).toHaveValue('Opening conflict');
   await expect(page.locator('.canvas-node.pending textarea').nth(1)).toHaveValue('');
   const nodes = [1, 2, 3].map((index) => ({ title: `Scene ${index}`, body: `Complete scene brief ${index}` }));
@@ -541,95 +303,3 @@ test('outline reserves the requested scene nodes before streaming and fills the 
   await expect(page.locator('.edge-hit')).toHaveCount(3);
 });
 
-test('project agent locates unattached nodes, persists a checkpoint and resumes after reload', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  let firstRequest: Record<string, unknown> | undefined;
-  let resumedRequest: Record<string, unknown> | undefined;
-  await page.route('**/api/assistant/stream', async (route) => {
-    const input = route.request().postDataJSON();
-    if (!input.checkpoint) {
-      firstRequest = input;
-      return route.fulfill({ contentType: 'application/x-ndjson', body: [
-        { type: 'checkpoint', checkpoint: { version: 1, step: 3, memory: 'Node 5 located; ready to finish' } },
-        { type: 'activity', step: 2, tool: 'delegate_parallel', title: '1 · Review scenes', message: 'Worker one checked continuity.', changedCount: 0 },
-        { type: 'activity', step: 2, tool: 'delegate_parallel', title: '2 · Review characters', message: 'Worker two checked motivation.', changedCount: 0 },
-        { type: 'activity', step: 3, tool: 'read_node', nodeId: 'node-5', changedCount: 0, message: 'Located the relevant scene.' },
-        { type: 'error', error: { code: 'agent_failed', message: 'Temporary provider interruption' } },
-      ].map((event) => JSON.stringify(event)).join('\n') + '\n' });
-    }
-    resumedRequest = input;
-    return assistantResult(route, { reply: 'Checked the located scene.', context: { nodes: [], worldbook: [] }, edits: [
-      { targetNodeId: 'node-5', operation: 'replace', nodeType: 'scene', title: 'Node 5', body: 'The repetition is removed.', baseBody: 'Content for node 5' },
-    ] });
-  });
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  let panel = page.getByRole('region', { name: 'Writing chat' });
-  await expect(panel.getByLabel('Scope', { exact: true })).toHaveValue('project');
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Find and remove repetitive descriptions throughout the novel');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(panel.getByRole('button', { name: 'Resume task', exact: true })).toBeVisible();
-  expect(firstRequest?.targetNodeIds).toEqual([]);
-  expect(firstRequest?.scope).toBe('project');
-  await expect(panel.locator('.agent-activity')).toContainText('Located the relevant scene.');
-  await expect(panel.locator('.agent-activity')).toContainText('Worker one checked continuity.');
-  await expect(panel.locator('.agent-activity')).toContainText('Worker two checked motivation.');
-  await page.screenshot({ path: 'test-results/agent-workflow.png', fullPage: true });
-  await expect(page.locator('[data-node-id="node-5"] textarea')).toHaveValue('Content for node 5');
-  await expect(page.locator('.save-indicator')).toContainText('Saved');
-  await page.reload();
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  panel = page.getByRole('region', { name: 'Writing chat' });
-  await expect(panel.locator('.agent-activity')).toContainText('Worker one checked continuity.');
-  await expect(panel.locator('.agent-activity')).toContainText('Worker two checked motivation.');
-  await panel.getByRole('button', { name: 'Resume task', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-5"] textarea')).toHaveValue('The repetition is removed.');
-  expect(resumedRequest?.checkpoint).toMatchObject({ step: 3, memory: 'Node 5 located; ready to finish' });
-  await panel.locator('.chat-change').getByRole('button', { name: 'Roll back', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-5"] textarea')).toHaveValue('Content for node 5');
-});
-
-test('project agent creates dependent nodes without attachments', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await page.route('**/api/assistant/stream', (route) => assistantResult(route, { reply: 'Designed the character and scene.', context: { nodes: [], worldbook: [] }, edits: [
-    { targetNodeId: '', proposedNodeId: 'agent-character', operation: 'create', nodeType: 'character', title: 'Mira', body: 'A reckless navigator.', creationSourceNodeIds: [] },
-    { targetNodeId: 'agent-character', proposedNodeId: 'agent-scene', operation: 'create', nodeType: 'scene', title: 'The crossing', body: 'Mira risks the crossing.', creationSourceNodeIds: ['agent-character'] },
-  ] }));
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  const panel = page.getByRole('region', { name: 'Writing chat' });
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Create a navigator and a scene based on her character');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.locator('[data-node-id="agent-character"] textarea')).toHaveValue('A reckless navigator.');
-  await expect(page.locator('[data-node-id="agent-scene"] textarea')).toHaveValue('Mira risks the crossing.');
-  await expect(panel.locator('.chat-change')).toHaveCount(2);
-  await panel.locator('.chat-change').nth(1).getByRole('button', { name: 'Roll back', exact: true }).click();
-  await panel.locator('.chat-change').nth(0).getByRole('button', { name: 'Roll back', exact: true }).click();
-  await expect(page.locator('[data-node-id="agent-character"]')).toHaveCount(0);
-  await expect(page.locator('[data-node-id="agent-scene"]')).toHaveCount(0);
-});
-
-test('project agent atomically deletes a node with its relationships and rolls back the complete batch', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop');
-  await mockApi(page, 3); await page.reload();
-  const snapshot = projectFixture(3);
-  await page.route('**/api/assistant/stream', (route) => assistantResult(route, {
-    reply: 'Removed the obsolete scene and updated the opening.', context: { nodes: [], worldbook: [] },
-    edits: [{ targetNodeId: 'node-0', operation: 'replace', nodeType: 'paragraph', title: 'Node 0', body: 'New opening', baseBody: 'Content for node 0' }],
-    mutations: [
-      { kind: 'edge', targetId: 'edge-1', before: snapshot.edges[1], after: null, index: 1 },
-      { kind: 'node_delete', targetId: 'node-1', before: snapshot.nodes[1], after: null, index: 1 },
-      { kind: 'edge', targetId: 'edge-0', before: snapshot.edges[0], after: null, index: 0 },
-    ],
-  }));
-  await page.getByRole('button', { name: 'Expand chat', exact: true }).click();
-  const panel = page.getByRole('region', { name: 'Writing chat' });
-  await panel.getByLabel('Request / feedback', { exact: true }).fill('Delete the obsolete scene and update the opening');
-  await panel.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('New opening');
-  await expect(page.locator('[data-node-id="node-1"]')).toHaveCount(0);
-  await expect(page.locator('.edge-hit')).toHaveCount(0);
-  await expect(panel.locator('.chat-structure-changes')).toContainText('Deleted node');
-  await panel.getByRole('button', { name: 'Roll back entire batch', exact: true }).click();
-  await expect(page.locator('[data-node-id="node-0"] textarea')).toHaveValue('Content for node 0');
-  await expect(page.locator('[data-node-id="node-1"] textarea')).toHaveValue('Content for node 1');
-  await expect(page.locator('.edge-hit')).toHaveCount(2);
-});

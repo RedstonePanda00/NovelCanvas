@@ -3,11 +3,10 @@ import ReactDOM from 'react-dom/client';
 import { api } from './api';
 import { CanvasWorkspace } from './CanvasWorkspace';
 import { I18nProvider, useI18n } from './i18n';
-import { createEmptyProject, downloadText } from './project';
+import { downloadText } from './project';
 import { ProjectStoreProvider, useProjectStore } from './projectStore';
 import { ExportPage, MemoryPage, PromptsPage, SettingsPage, WorldbookPage } from './pages';
 import './styles.css';
-import './chat.css';
 
 type View = 'canvas' | 'memory' | 'worldbook' | 'prompts' | 'export' | 'settings';
 
@@ -42,10 +41,9 @@ function App() {
     if (project && !window.confirm(t('confirmReplaceProject'))) return;
     const title = window.prompt(t('title'), 'Untitled Novel Canvas Project');
     if (title === null) return;
-    const draft = createEmptyProject(title.trim() || 'Untitled Novel Canvas Project');
     try {
       if (project) await saveNow();
-      openProject(await api.saveProject(draft));
+      openProject(await api.newProject(title));
       setActiveView('canvas');
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : t('saveFailed'));
@@ -71,11 +69,11 @@ function App() {
       <button className="mobile-nav-toggle" type="button" aria-label={t('mobileMenu')} onClick={() => setMobileNav((value) => !value)}>☰</button>
       <div className="brand-mark">N</div><div className="brand-copy"><strong>{t('appName')}</strong><span>{project?.title ?? t('loading')}</span></div>
       <div className="app-bar-spacer" />
-      <button type="button" className={`save-indicator state-${saveStatus}`} onClick={() => void saveNow()} title={saveMessage || t('saveNow')}><span />{saveLabel}</button>
+      <button type="button" className={`save-indicator state-${saveStatus}`} onClick={() => void saveNow().catch(() => undefined)} title={saveMessage || t('saveNow')}><span />{saveLabel}</button>
       <button type="button" className="locale-switch" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>{locale === 'en' ? '中文' : 'EN'}</button>
       <details className="project-menu"><summary aria-label={t('projectMenu')}>{t('project')} ▾</summary><div className="menu-popover">
         {project ? <label>{t('title')}<input value={project.title} onChange={(event) => updateProject((current) => ({ ...current, title: event.target.value }))} /></label> : null}
-        <button type="button" onClick={() => void saveNow()}>{t('saveNow')}<span>Ctrl/⌘ S</span></button>
+        <button type="button" onClick={() => void saveNow().catch(() => undefined)}>{t('saveNow')}<span>Ctrl/⌘ S</span></button>
         <button type="button" onClick={backup}>{t('backupProject')}<span>JSON</span></button>
         <label className="menu-file-button">{t('loadProject')}<input type="file" accept=".json,application/json" onChange={(event) => { void importProject(event.target.files?.[0] ?? null); event.target.value = ''; }} /></label>
         <button type="button" onClick={() => void newProject()}>{t('newProject')}</button>
@@ -85,10 +83,10 @@ function App() {
     <aside className={`primary-nav ${mobileNav ? 'open' : ''}`}><nav>{nav.map((item) => <button type="button" key={item.id} className={activeView === item.id ? 'active' : ''} onClick={() => { setActiveView(item.id); setMobileNav(false); }}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav><div className="nav-footer"><span>LOCAL</span><small>v0.2 workspace</small></div></aside>
     <div className="app-main">
       {loading ? <div className="startup-state"><div className="brand-mark large">N</div><h1>{t('appName')}</h1><p>{t('loading')}</p></div> : loadError && !project ? <div className="startup-state"><h1>{t('failedToLoad')}</h1><p>{loadError}</p><button type="button" onClick={() => void loadProject()}>{t('retry')}</button></div> : <>
-        {loadError ? <div className="warning-callout" role="alert">{loadError}</div> : null}
+        {(loadError || saveMessage) && <div className="warning-callout" role="alert">{loadError || saveMessage}</div>}
         <div hidden={activeView !== 'canvas'}><CanvasWorkspace key={session} active={activeView === 'canvas'} /></div>
         {activeView === 'memory' ? <MemoryPage /> : null}
-        {activeView === 'worldbook' ? <WorldbookPage /> : null}
+        {activeView === 'worldbook' ? <WorldbookPage key={session} /> : null}
         {activeView === 'prompts' ? <PromptsPage /> : null}
         {activeView === 'export' ? <ExportPage /> : null}
         {activeView === 'settings' ? <SettingsPage /> : null}

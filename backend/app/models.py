@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+import base64
+import binascii
 
 from typing import Any, Literal
 
@@ -16,6 +18,7 @@ NodeType = Literal[
     "character",
     "supplemental_info",
     "instruction",
+    "image",
     "container",
 ]
 
@@ -66,6 +69,31 @@ class EdgeMetadata(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class ImageAttachment(BaseModel):
+    dataUrl: str = Field(max_length=2_796_240)
+    fileName: str = Field(max_length=255)
+
+    @field_validator("dataUrl")
+    @classmethod
+    def validate_image(cls, value: str) -> str:
+        header, separator, encoded = value.partition(",")
+        signatures = {
+            "data:image/png;base64": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+            "data:image/jpeg;base64": lambda data: data.startswith(b"\xff\xd8\xff"),
+            "data:image/gif;base64": lambda data: data.startswith((b"GIF87a", b"GIF89a")),
+            "data:image/webp;base64": lambda data: data[:4] == b"RIFF" and data[8:12] == b"WEBP",
+        }
+        if not separator or header not in signatures:
+            raise ValueError("Use a PNG, JPEG, WebP or GIF image")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid image encoding") from exc
+        if len(data) > 2 * 1024 * 1024 or not signatures[header](data):
+            raise ValueError("Invalid image or image exceeds 2 MB")
+        return value
+
+
 class CanvasNode(BaseModel):
     @model_validator(mode="before")
     @classmethod
@@ -83,6 +111,8 @@ class CanvasNode(BaseModel):
     targetWordCount: int | None = None
     narrativeTask: str | None = None
     childNodeIds: list[str] = Field(default_factory=list)
+    image: ImageAttachment | None = None
+    worldbookEntryIds: list[str] = Field(default_factory=list)
 
 
 class CanvasEdge(BaseModel):
@@ -479,6 +509,7 @@ class KnowledgeChunk(BaseModel):
 
 
 class KnowledgeIndexEntry(BaseModel):
+    textHash: str = ""
     chunkId: str
     documentId: str
     embeddingModelId: str

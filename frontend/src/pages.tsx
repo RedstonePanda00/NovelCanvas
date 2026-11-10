@@ -3,6 +3,8 @@ import { api, type DiscoveredModel, type ProviderTestResult } from './api';
 import { useI18n } from './i18n';
 import { createWorldbookEntry, downloadText, parseDelimitedList } from './project';
 import { parseWorldbookImport } from './projectOperations';
+import { WorldbookIllustrations } from './WorldbookIllustrations';
+import { parseWorldbookImages } from './projectOperations';
 import { useProjectStore } from './projectStore';
 import type {
   KnowledgeBaseMetadata, ModelRoutingSettings, PublicLocalAppConfig, RegisteredModel, WorldbookEntry,
@@ -66,9 +68,11 @@ export function WorldbookPage() {
   const importWorldbook = async (file: File | null) => {
     if (!file) return;
     try {
-      const imported = parseWorldbookImport(JSON.parse(await file.text()) as unknown);
+      const payload: unknown = JSON.parse(await file.text());
+      const imported = parseWorldbookImport(payload);
+      const images = parseWorldbookImages(payload, imported);
       if (project.worldbook.entries.length && !window.confirm(t('confirmReplaceWorldbook'))) return;
-      updateProject((current) => ({ ...current, worldbook: { entries: imported } }));
+      updateProject((current) => ({ ...current, worldbook: { entries: imported }, nodes: [...current.nodes.map(node => ({ ...node, worldbookEntryIds: [] })), ...images] }));
       setStatus(`${imported.length} entries imported.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Invalid Worldbook JSON');
@@ -77,7 +81,7 @@ export function WorldbookPage() {
   return <main className="page-content">
     <PageHeader eyebrow={t('worldbook')} title={t('worldbook')} description={t('worldbookDescription')} actions={<>
       <button type="button" onClick={() => updateProject((current) => ({ ...current, worldbook: { entries: [createWorldbookEntry(), ...current.worldbook.entries] } }))}>{t('addEntry')}</button>
-      <button type="button" className="secondary" onClick={() => downloadText(`${project.title}-worldbook.json`, JSON.stringify(project.worldbook, null, 2), 'application/json')}>{t('exportWorldbook')}</button>
+      <button type="button" className="secondary" onClick={() => downloadText(`${project.title}-worldbook.json`, JSON.stringify({ ...project.worldbook, imageNodes: project.nodes.filter(node => node.type === 'image' && node.worldbookEntryIds?.some(id => project.worldbook.entries.some(entry => entry.id === id))) }, null, 2), 'application/json')}>{t('exportWorldbook')}</button>
       <label className="button-like secondary">{t('importWorldbook')}<input type="file" accept=".json,application/json" onChange={(event) => { void importWorldbook(event.target.files?.[0] ?? null); event.target.value = ''; }} /></label>
     </>} />
     <div className="filter-bar"><input aria-label={t('searchNodes')} placeholder={t('searchNodes')} value={search} onChange={(event) => setSearch(event.target.value)} /><label className="inline-check"><input type="checkbox" checked={enabledOnly} onChange={(event) => setEnabledOnly(event.target.checked)} />{t('enabled')}</label><span>{entries.length} / {project.worldbook.entries.length}</span></div>
@@ -88,6 +92,7 @@ export function WorldbookPage() {
       <div className="form-grid two"><label>{t('keys')}<input value={entry.keys.join(', ')} onChange={(event) => updateEntry(entry.id, { keys: parseDelimitedList(event.target.value) })} /></label><label>{t('tags')}<input value={entry.tags.join(', ')} onChange={(event) => updateEntry(entry.id, { tags: parseDelimitedList(event.target.value) })} /></label></div>
       <div className="form-grid three"><label>{t('priority')}<input type="number" value={entry.priority} onChange={(event) => updateEntry(entry.id, { priority: Number(event.target.value) })} /></label><label>{t('tokenBudget')}<input type="number" min="0" value={entry.tokenBudget ?? ''} onChange={(event) => updateEntry(entry.id, { tokenBudget: event.target.value ? Number(event.target.value) : null })} /></label><label>{t('insertion')}<select value={entry.insertionPosition} onChange={(event) => updateEntry(entry.id, { insertionPosition: event.target.value as WorldbookEntry['insertionPosition'] })}><option value="before_context">before context</option><option value="after_context">after context</option></select></label></div>
       <label>{t('content')}<textarea rows={10} value={entry.content} onChange={(event) => updateEntry(entry.id, { content: event.target.value })} /></label>
+      <WorldbookIllustrations entryId={entry.id} />
       <button type="button" className="danger" onClick={() => updateProject((current) => ({ ...current, worldbook: { entries: current.worldbook.entries.filter((item) => item.id !== entry.id) } }))}>{t('deleteNode')}</button>
     </div></details>)}</section>
   </main>;
@@ -133,7 +138,6 @@ export function SettingsPage() {
   const [capabilities, setCapabilities] = useState<RegisteredModel['capabilityTags']>(['text']);
   const [contextWindow, setContextWindow] = useState(''); const [embeddingDimensions, setEmbeddingDimensions] = useState('');
   const [result, setResult] = useState<ProviderTestResult | null>(null); const [status, setStatus] = useState('');
-  const [chatModelBusy, setChatModelBusy] = useState(false);
 
   useEffect(() => { void api.getAppConfig().then((value) => { setConfig(value); setSelectedProviderId(value.providers[0]?.id ?? ''); }).catch((error: unknown) => setStatus(error instanceof Error ? error.message : t('unavailable'))); }, [t]);
   if (!project) return null;
@@ -150,17 +154,15 @@ export function SettingsPage() {
   const test = async () => { try { setResult(await api.testProvider(selectedProviderId, capabilities.some((tag) => tag !== 'embedding') ? selectedModelId || undefined : undefined, capabilities.includes('embedding') ? selectedModelId || undefined : undefined)); } catch (error) { setStatus(error instanceof Error ? error.message : t('unavailable')); } };
   const register = async () => { try { setConfig(await api.registerModel({ providerId: selectedProviderId, modelId: selectedModelId, displayName: selectedModelId, capabilityTags: capabilities, contextWindowTokens: contextWindow ? Number(contextWindow) : null, embeddingDimensions: embeddingDimensions ? Number(embeddingDimensions) : null })); setStatus(t('saved')); } catch (error) { setStatus(error instanceof Error ? error.message : t('unavailable')); } };
   const updateRoute = (key: keyof ModelRoutingSettings, value: string) => updateProject((current) => ({ ...current, settings: { ...current.settings, modelRouting: { ...current.settings.modelRouting, [key]: value || null } } }));
-  const saveChatModel = async (id: string) => { setChatModelBusy(true); try { setConfig(await api.setChatModel(id || null)); setStatus(t('saved')); } catch (e) { setStatus(e instanceof Error ? e.message : String(e)); } finally { setChatModelBusy(false); } };
   return <main className="page-content">
     <PageHeader eyebrow={t('settings')} title={t('settings')} description={t('keepKeyHint')} />
-    <section className="form-card"><label>{t('chatModel')}<select disabled={chatModelBusy} value={config.chatModelId ?? ''} onChange={(e) => void saveChatModel(e.target.value)}><option value="">—</option>{config.registeredModels.filter((model) => model.enabled && model.capabilityTags.some((tag) => tag !== 'embedding')).map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label><p className="helper-text">{t('chatModelHint')}</p></section>
     {status ? <div className="status-line">{status}</div> : null}
     <section className="settings-grid"><form className="form-card" onSubmit={(event) => void saveProvider(event)}><div className="card-heading"><span className="card-icon">⌁</span><div><h3>{t('provider')}</h3><p>{t('keepKeyHint')}</p></div></div>
       <div className="form-grid two"><label>{t('providerId')}<input required value={providerId} onChange={(event) => setProviderId(event.target.value)} /></label><label>{t('providerName')}<input required value={providerName} onChange={(event) => setProviderName(event.target.value)} /></label></div>
       <label>{t('apiRoot')}<input required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label><label>{t('apiKey')}<input type="password" value={apiKey} disabled={clearKey} onChange={(event) => setApiKey(event.target.value)} /><small>{t('keepKeyHint')}</small></label><label className="inline-check"><input type="checkbox" checked={clearKey} onChange={(event) => setClearKey(event.target.checked)} />{t('clearSavedKey')}</label><label>{t('customHeaders')}<textarea rows={4} value={headersJson} onChange={(event) => setHeadersJson(event.target.value)} /></label><button type="submit">{t('saveProvider')}</button>
     </form>
     <section className="form-card"><div className="card-heading"><span className="card-icon">◎</span><div><h3>{t('models')}</h3><p>{t('capabilities')}</p></div></div><label>{t('provider')}<select value={selectedProviderId} onChange={(event) => { setSelectedProviderId(event.target.value); setModels([]); setSelectedModelId(''); setResult(null); }}><option value="">—</option>{config.providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label><div className="button-row"><button type="button" disabled={!selectedProviderId} onClick={() => void discover()}>{t('discoverModels')}</button><button type="button" className="secondary" disabled={!selectedProviderId} onClick={() => void test()}>{t('testProvider')}</button></div><label>{t('discoveredModel')}<select value={selectedModelId} onChange={(event) => setSelectedModelId(event.target.value)}><option value="">—</option>{models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}</select></label><div className="chip-checks">{(['text', 'structure', 'compression', 'embedding', 'vision'] as const).map((capability) => <label key={capability}><input type="checkbox" checked={capabilities.includes(capability)} onChange={() => setCapabilities((current) => current.includes(capability) ? current.filter((item) => item !== capability) : [...current, capability])} />{capability}</label>)}</div><div className="form-grid two"><label>{t('contextWindow')}<input type="number" min="0" value={contextWindow} onChange={(event) => setContextWindow(event.target.value)} /></label><label>{t('embeddingDimensions')}<input type="number" min="0" value={embeddingDimensions} onChange={(event) => setEmbeddingDimensions(event.target.value)} /></label></div><button type="button" disabled={!selectedProviderId || !selectedModelId} onClick={() => void register()}>{t('registerModel')}</button>{result ? <div className="result-box"><span>List: {String(result.modelListingOk)}</span><span>Chat: {String(result.chatCompletionOk ?? '—')}</span><span>Embedding: {String(result.embeddingOk ?? '—')}</span>{result.errors.map((error) => <span className="error-text" key={error}>{error}</span>)}</div> : null}</section></section>
-    <section className="form-card"><div className="card-heading"><span className="card-icon">⇄</span><div><h3>{t('modelRouting')}</h3><p>{t('projectLanguage')}</p></div></div><div className="form-grid three"><label>{t('projectLanguage')}<select value={project.settings.defaultLanguage} onChange={(event) => updateProject((current) => ({ ...current, settings: { ...current.settings, defaultLanguage: event.target.value } }))}><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>{routeLabels.map((route) => <label key={route.key}>{t(route.label)}<select value={project.settings.modelRouting[route.key] ?? ''} onChange={(event) => updateRoute(route.key, event.target.value)}><option value="">—</option>{config.registeredModels.filter((model) => model.enabled && (route.key !== 'embeddingModelId' || model.capabilityTags.includes('embedding'))).map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label>)}</div></section>
+    <section className="form-card"><div className="card-heading"><span className="card-icon">⇄</span><div><h3>{t('modelRouting')}</h3><p>{t('modelRoutingHint')}</p></div></div><div className="form-grid three"><label>{t('projectLanguage')}<select value={project.settings.defaultLanguage} onChange={(event) => updateProject((current) => ({ ...current, settings: { ...current.settings, defaultLanguage: event.target.value } }))}><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>{routeLabels.map((route) => <label key={route.key}>{t(route.label)}<select aria-label={t(route.label)} value={project.settings.modelRouting[route.key] ?? ''} onChange={(event) => updateRoute(route.key, event.target.value)}><option value="">—</option>{config.registeredModels.filter((model) => model.enabled && (route.key !== 'embeddingModelId' || model.capabilityTags.includes('embedding'))).map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label>)}</div></section>
     <section className="form-card"><h3>{t('registeredModels')}</h3><div className="card-list">{config.registeredModels.map((model) => <article key={model.id} className="content-card"><div><strong>{model.displayName}</strong><span>{model.modelId}</span></div><span>{model.capabilityTags.join(' · ')}</span></article>)}</div></section>
   </main>;
 }
